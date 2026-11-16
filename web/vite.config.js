@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { defineConfig } from 'vite';
 import basicSsl from '@vitejs/plugin-basic-ssl';
@@ -64,10 +64,54 @@ const selftestUpload = {
   },
 };
 
+// Dev only: the app has no debugger attached, so native code and the web pages POST log
+// lines here. Each line is printed in the dev-server terminal and appended to
+// <project root>/notes/logs/YYYY-MM-DD.jsonl. Body: {source, level, message, data?, ...}, at most 256 KB.
+// BLIND TEST: Jiang watches this terminal – never log a trial's width or delta.
+const logReceiver = {
+  name: 'log-receiver',
+  configureServer(server) {
+    server.middlewares.use('/__log', (req, res) => {
+      const reply = (code, obj) => {
+        res.writeHead(code, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(obj));
+      };
+      if (req.method !== 'POST') return reply(405, { ok: false, error: 'POST only' });
+      const chunks = [];
+      let size = 0;
+      req.on('data', (c) => {
+        size += c.length;
+        if (size > 256 * 1024) req.destroy();
+        else chunks.push(c);
+      });
+      req.on('end', () => {
+        try {
+          const entry = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('need a JSON object');
+          const now = new Date();
+          const line = { receivedAt: now.toISOString(), ip: req.socket.remoteAddress, ...entry };
+          const dir = resolve(NOTES_DIR, 'logs');
+          mkdirSync(dir, { recursive: true });
+          const day = now.toLocaleDateString('sv-SE'); // YYYY-MM-DD in the PC's time zone
+          appendFileSync(resolve(dir, `${day}.jsonl`), JSON.stringify(line) + '\n');
+          const src = String(entry.source || '?');
+          const lvl = entry.level && entry.level !== 'info' ? ` ${String(entry.level).toUpperCase()}` : '';
+          const data = entry.data === undefined ? '' : ' ' + JSON.stringify(entry.data).slice(0, 300);
+          const say = lvl.includes('ERROR') ? server.config.logger.error : server.config.logger.info;
+          say.call(server.config.logger, `[${src}${lvl}] ${String(entry.message ?? '').slice(0, 300)}${data}`, { timestamp: true });
+          reply(200, { ok: true });
+        } catch (e) {
+          reply(400, { ok: false, error: String(e.message || e) });
+        }
+      });
+    });
+  },
+};
+
 export default defineConfig(({ mode }) => ({
   base: process.env.BASE_PATH || '/',
   server: { host: true, port: 5173, strictPort: true },
-  plugins: mode === 'ssl' ? [basicSsl(), usdzMime, selftestUpload] : [usdzMime, selftestUpload],
+  plugins: mode === 'ssl' ? [basicSsl(), usdzMime, selftestUpload, logReceiver] : [usdzMime, selftestUpload, logReceiver],
   // pre-bundle three and the addon together so dev doesn't load two copies of three
   optimizeDeps: { include: ['three', 'three/addons/loaders/GLTFLoader.js', 'three/addons/exporters/USDZExporter.js'] },
   build: {
@@ -76,6 +120,7 @@ export default defineConfig(({ mode }) => ({
     rolldownOptions: {
       input: {
         main: resolve(import.meta.dirname, 'index.html'), // the trial page
+        check: resolve(import.meta.dirname, 'check.html'), // on-device check for the current stage
       },
     },
   },

@@ -35,5 +35,10 @@ targets:
           UIApplicationSupportsMultipleScenes: false
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         UIRequiredDeviceCapabilities: [arm64]
+        # The pages and logs come from the PC's dev server over plain http on the LAN.
+        NSLocalNetworkUsageDescription: 连接电脑上的开发服务器，加载试次页、发送日志和数据。
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+          NSAllowsLocalNetworking: true
         ARAppGitCommit: $(GIT_COMMIT)
         ARAppBuildTime: $(BUILD_TIME)

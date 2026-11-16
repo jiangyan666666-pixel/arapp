@@ -18,6 +18,10 @@
 import * as store from './trials.js';
 import { MODELS } from './furniture.js';
 import { furnitureUSDZ } from './usdz.js';
+import { callNative, hasNative, versionLabel } from './native.js';
+import { forwardErrors, log } from './log.js';
+
+forwardErrors();
 
 const CURRENT_KEY = 'ar-hand-ruler/iphone-current';
 const INSTRUCTION_LABELS = { A: 'A 只用眼睛看（不伸手）', B: 'B 手伸进画面当尺子', C: 'C 走进空隙', other: '其他' };
@@ -113,6 +117,7 @@ const mean = (xs) => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : Na
 
 function initSetup() {
   ui.noAr.classList.toggle('hidden', CAN_AR);
+  if (hasNative) ui.noAr.textContent = 'app 里暂时还打不开 AR（阶段 4 才接上原生 AR）。在这里只能走一遍流程。';
   ui.fModel.innerHTML = MODELS.filter((m) => m.kind === 'procedural')
     .map((m) => `<option value="${m.id}">${escapeHtml(m.label)}</option>`)
     .join('');
@@ -523,6 +528,19 @@ $('btn-clear').addEventListener('click', () => {
   saveCurrent();
   showData();
 });
+
+$('btn-check').addEventListener('click', () => {
+  location.href = '/check.html';
+});
+$('btn-server').classList.toggle('hidden', !hasNative);
+$('btn-server').addEventListener('click', () => callNative('openSettings').catch(() => {}));
+$('ver').textContent = versionLabel();
+try {
+  sessionStorage.setItem('arapp/saw-trial-page', '1'); // read by the on-device check (src/check.js)
+} catch {
+  /* storage blocked */
+}
+log('trial page loaded');
 
 initSetup();
 showScreen('setup');
