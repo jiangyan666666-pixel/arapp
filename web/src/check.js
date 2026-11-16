@@ -26,11 +26,12 @@ function render() {
   $('steps').innerHTML = '';
   STEPS.forEach((s, i) => {
     const r = results[s.id];
+    const state = !r || r.ok === null ? '' : r.ok ? 'ok' : 'bad';
     const card = document.createElement('div');
     card.className = 'card';
     const row = document.createElement('div');
-    row.className = `step ${r ? (r.ok ? 'ok' : 'bad') : ''}`;
-    row.innerHTML = `<div class="mark">${r ? (r.ok ? '✓' : '✗') : i + 1}</div><div><div class="title"></div><div class="detail"></div></div>`;
+    row.className = `step ${state}`;
+    row.innerHTML = `<div class="mark">${state === 'ok' ? '✓' : state === 'bad' ? '✗' : i + 1}</div><div><div class="title"></div><div class="detail"></div></div>`;
     row.querySelector('.title').textContent = s.title;
     row.querySelector('.detail').textContent = r ? r.detail : s.auto ? '检查中…' : '';
     card.appendChild(row);
@@ -43,7 +44,7 @@ function render() {
     $('steps').appendChild(card);
   });
 
-  const done = REQUIRED.every((id) => results[id]);
+  const done = REQUIRED.every((id) => results[id] && results[id].ok !== null);
   const passed = REQUIRED.every((id) => results[id]?.ok);
   const v = $('verdict');
   v.className = done ? (passed ? 'ok' : 'bad') : '';
@@ -57,6 +58,7 @@ function render() {
       : '把这一屏截图发给 Claude。';
 }
 
+/** ok: true / false, or null while still waiting */
 function set(id, ok, detail) {
   results[id] = { ok, detail };
   render();
@@ -87,12 +89,24 @@ async function runAuto() {
   set('trial', sawTrial, sawTrial ? '试次页加载过' : '没记录到试次页加载。先回到试次页，再点「上机检查」');
 
   // 2. The native startup log is sent by the app itself; ask the app whether it got through.
+  //    The first attempt usually fails while iOS asks for local-network permission (-1009), and
+  //    the app resends whenever a page finishes loading – i.e. right as this page asks. So keep
+  //    asking for a few seconds before calling it a failure.
   if (!hasNative) {
     set('nativeLog', false, '不在 app 里打开的（没有原生层）');
   } else {
     try {
-      const s = await callNative('status');
-      set('nativeLog', Boolean(s.startupLogOK), `${s.startupLog}（电脑地址 ${s.server}）`);
+      let s = await callNative('status');
+      let waited = 0;
+      while (!s.startupLogOK && waited < 8) {
+        set('nativeLog', null, `${s.startupLog}，等 app 重发…（${waited} 秒）`);
+        await new Promise((r) => setTimeout(r, 1000));
+        if (my !== runId) return;
+        waited++;
+        s = await callNative('status');
+      }
+      const note = waited ? `（重发后，等了 ${waited} 秒）` : '';
+      set('nativeLog', Boolean(s.startupLogOK), `${s.startupLog}${note}（电脑地址 ${s.server}）`);
     } catch (e) {
       set('nativeLog', false, String(e.message || e));
     }
@@ -114,7 +128,7 @@ async function runAuto() {
       const reply = await callNative('ping', { token });
       const ms = Math.round(performance.now() - t0);
       const ok = reply.type === 'pong' && reply.echo?.token === token;
-      set('roundTrip', ok, ok ? `来回 ${ms} ms` : `回复不对：${JSON.stringify(reply).slice(0, 120)}`);
+      set('roundTrip', ok, ok ? `来回 ${ms < 1 ? '不到 1' : ms} ms` : `回复不对：${JSON.stringify(reply).slice(0, 120)}`);
     } catch (e) {
       set('roundTrip', false, String(e.message || e));
     }
