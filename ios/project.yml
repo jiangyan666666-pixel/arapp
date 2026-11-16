@@ -1,0 +1,39 @@
+# XcodeGen spec. The cloud build runs `xcodegen generate` here; the .xcodeproj and
+# Info.plist it writes are not committed.
+name: ARApp
+options:
+  bundleIdPrefix: local.arapp
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+    # Overridden on the xcodebuild command line by the cloud build; shown on screen.
+    GIT_COMMIT: local
+    BUILD_TIME: local
+targets:
+  ARApp:
+    type: application
+    platform: iOS
+    sources: [ARApp]
+    scheme: {}
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.arapp.v0
+        TARGETED_DEVICE_FAMILY: "1"
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: ARApp
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        UIRequiredDeviceCapabilities: [arm64]
+        ARAppGitCommit: $(GIT_COMMIT)
+        ARAppBuildTime: $(BUILD_TIME)

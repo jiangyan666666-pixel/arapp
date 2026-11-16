@@ -1,0 +1,67 @@
+# Unsigned iOS build in the cloud → ARApp-<commit>.ipa as a downloadable artifact.
+# Sideloadly signs it with the Apple ID when installing.
+#   gh workflow run ios.yml                      # build the current main
+#   gh run list -w ios.yml -L 3                  # find the run
+#   gh run download <run-id> -D build-out        # → build-out/ARApp-<commit>/ARApp-<commit>.ipa
+name: ios
+
+on:
+  push:
+    branches: [main]
+    paths: ['ios/**', '.github/workflows/ios.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tools
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Build (unsigned)
+        working-directory: ios
+        run: |
+          SHORT=${GITHUB_SHA::7}
+          STAMP=$(TZ=Asia/Tokyo date '+%m-%d %H:%M JST')
+          echo "SHORT=$SHORT" >> "$GITHUB_ENV"
+          xcodebuild build \
+            -project ARApp.xcodeproj -scheme ARApp -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath build -quiet \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            GIT_COMMIT="$SHORT" BUILD_TIME="$STAMP"
+
+      - name: Package .ipa
+        working-directory: ios
+        run: |
+          APP=build/Build/Products/Release-iphoneos/ARApp.app
+          test -d "$APP"
+          /usr/libexec/PlistBuddy -c 'Print :ARAppGitCommit' -c 'Print :ARAppBuildTime' "$APP/Info.plist"
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          (cd out && zip -qry "../ARApp-$SHORT.ipa" Payload)
+          ls -l "ARApp-$SHORT.ipa"
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ARApp-${{ env.SHORT }}
+          path: ios/ARApp-${{ env.SHORT }}.ipa
+          retention-days: 14
+          if-no-files-found: error
