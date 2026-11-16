@@ -1,14 +1,38 @@
 // Bridge to the native iOS layer (ios/ARApp/WebView.swift).
 //
 //   web → native: window.webkit.messageHandlers.native.postMessage({type, id, payload})
-//   native → web: window.__fromNative({id, ...reply})
+//   native → web: window.__fromNative({id, ...reply})     reply to one message
+//                 window.__nativeEvent({type, ...})       unasked, e.g. "ar.status"
 //
 // callNative() returns a promise for the reply. In a normal browser there is no native layer:
 // hasNative is false and callNative() rejects, so pages still work for a desktop run-through.
 
-/** Injected by the app before any page script runs: {version, buildTime, label, ios, model}. */
+/** Injected by the app before any page script runs: {version, buildTime, label, ios, model, features}. */
 export const nativeInfo = window.__nativeInfo || null;
 export const hasNative = Boolean(window.webkit?.messageHandlers?.native);
+/** The installed app has the native AR layer (stage 2 and later; the stage-1 app does not). */
+export const hasAR = hasNative && Array.isArray(nativeInfo?.features) && nativeInfo.features.includes('ar');
+
+const listeners = new Map(); // event type → Set of functions
+
+window.__nativeEvent = (event) => {
+  const set = event && listeners.get(event.type);
+  if (!set) return;
+  for (const fn of set) {
+    try {
+      fn(event);
+    } catch (e) {
+      console.error(e);
+    }
+  }
+};
+
+/** Listen for an event the native layer sends by itself. Returns a function that stops listening. */
+export function onNativeEvent(type, fn) {
+  if (!listeners.has(type)) listeners.set(type, new Set());
+  listeners.get(type).add(fn);
+  return () => listeners.get(type)?.delete(fn);
+}
 
 const pending = new Map();
 let seq = 0;
@@ -23,7 +47,7 @@ window.__fromNative = (msg) => {
 };
 
 /**
- * @param {string} type  'ping' | 'status' | 'openSettings'
+ * @param {string} type  'ping' | 'status' | 'openSettings' | 'ar.*' (see ar.js)
  * @param {any} [payload]
  * @param {number} [timeoutMs]
  * @returns {Promise<object>} the native reply

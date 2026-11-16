@@ -1,9 +1,9 @@
 import Foundation
 import UIKit
 
-// App-wide state: which PC to load the pages from, whether loading failed, and whether the
-// startup log reached the PC. The PC's LAN address changes, so it is editable in the app
-// (SettingsView) and remembered in UserDefaults.
+// App-wide state: which PC to load the pages from, whether loading failed, the AR layer, and
+// whether the startup log reached the PC. The PC's LAN address changes, so it is editable in
+// the app (SettingsView) and remembered in UserDefaults.
 @MainActor
 final class AppModel: ObservableObject {
     static let defaultServer = "http://192.168.0.215:5173"
@@ -13,15 +13,18 @@ final class AppModel: ObservableObject {
     @Published var loadError: String?
     @Published var showSettings = false
 
+    /// The native AR layer under the web page (ARController.swift).
+    let ar: ARController
+
     /// Set by WebView: reloads the page from `serverURL`.
     var reload: (@MainActor () -> Void)?
 
-    private(set) var startupLog = "还没发送"
-    private(set) var startupLogOK = false
-    private var sendingStartupLog = false
+    private var startupSeq: Int?
 
     init() {
         serverURL = UserDefaults.standard.string(forKey: Self.serverKey) ?? Self.defaultServer
+        ar = ARController()
+        NativeLog.shared.server = serverURL
     }
 
     /// Accepts "192.168.0.5:5173", "http://192.168.0.5:5173/" etc.; empty → default.
@@ -32,43 +35,54 @@ final class AppModel: ObservableObject {
         if s.isEmpty { s = Self.defaultServer }
         serverURL = s
         UserDefaults.standard.set(s, forKey: Self.serverKey)
-        startupLogOK = false
-        startupLog = "还没发送"
+        NativeLog.shared.server = s
+        NativeLog.shared.log("server address saved")
         reload?()
-        Task { await sendStartupLog() }
     }
 
     func retry() {
         reload?()
-        if !startupLogOK { Task { await sendStartupLog() } }
+        NativeLog.shared.flush()
     }
 
-    /// Called when a page finished loading. The first launch usually fails the startup log
-    /// while iOS asks for local-network permission, so try again once a page got through.
+    /// Called when a page finished loading: the PC is reachable now, so send what is queued.
+    /// (The first launch cannot send while iOS is still asking for local-network permission.)
     func pageLoaded() {
         loadError = nil
-        if !startupLogOK { Task { await sendStartupLog() } }
+        NativeLog.shared.flush()
     }
 
-    func sendStartupLog() async {
-        if sendingStartupLog || startupLogOK { return }
-        sendingStartupLog = true
-        defer { sendingStartupLog = false }
-        let error = await NativeLog.post(
-            server: serverURL,
-            message: "app started",
-            data: ["ios": UIDevice.current.systemVersion, "model": BuildInfo.deviceModel]
-        )
-        startupLogOK = error == nil
-        startupLog = error.map { "发送失败：\($0)" } ?? "电脑收到了"
+    /// Queued once per launch. It stays queued until the PC has it (NativeLog).
+    func sendStartupLog() {
+        guard startupSeq == nil else { return }
+        var data: [String: Any] = [
+            "ios": UIDevice.current.systemVersion,
+            "model": BuildInfo.deviceModel,
+            "buildTime": BuildInfo.time,
+            "queuedFromEarlier": NativeLog.shared.pendingCount,
+        ]
+        if let crash = CrashNote.take() {
+            data["previousRunEndedWith"] = crash
+        }
+        startupSeq = NativeLog.shared.log("app started", data: data)
     }
 
     /// Reply to the web page's "status" message.
     func status() -> [String: Any] {
-        [
+        let delivered = startupSeq.map { !NativeLog.shared.isPending($0) } ?? false
+        let text: String
+        if delivered {
+            text = "电脑收到了"
+        } else if let error = NativeLog.shared.lastError {
+            text = "发送失败：\(error)"
+        } else {
+            text = "还没发送"
+        }
+        return [
             "server": serverURL,
-            "startupLog": startupLog,
-            "startupLogOK": startupLogOK,
+            "startupLog": text,
+            "startupLogOK": delivered,
+            "logPending": NativeLog.shared.pendingCount,
             "version": BuildInfo.commit,
             "buildTime": BuildInfo.time,
         ]

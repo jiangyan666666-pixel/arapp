@@ -37,6 +37,8 @@ targets:
         UIRequiredDeviceCapabilities: [arm64]
         # The pages and logs come from the PC's dev server over plain http on the LAN.
         NSLocalNetworkUsageDescription: 连接电脑上的开发服务器，加载试次页、发送日志和数据。
+        # Without this the app is killed the moment the AR camera starts.
+        NSCameraUsageDescription: 用相机显示 AR 画面，把 1:1 的家具放进真实的房间里。
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
           NSAllowsLocalNetworking: true

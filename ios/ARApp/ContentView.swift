@@ -1,13 +1,18 @@
 import SwiftUI
 
-// Stage 1: the whole screen is the web page from the PC. Native UI only appears when the page
-// can't load (ErrorPanel) or when the page asks for the server-address screen (SettingsView).
+// The whole screen is the web page from the PC, transparent, on top of the native AR picture
+// (stage 2). Pages that are not AR paint their own black background. Native UI only appears
+// when the page can't load (ErrorPanel) or when the page asks for the server-address screen
+// (SettingsView).
 struct ContentView: View {
     @StateObject private var model = AppModel()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
+            ARLayer(controller: model.ar)
+                .ignoresSafeArea()
             WebView(model: model)
                 .ignoresSafeArea()
             if let error = model.loadError {
@@ -18,10 +23,22 @@ struct ContentView: View {
             SettingsView(model: model)
         }
         .task {
-            await model.sendStartupLog()
+            model.sendStartupLog()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { NativeLog.shared.flush() }
         }
         .preferredColorScheme(.dark)
     }
+}
+
+/// The plain view the AR picture is drawn into (ARController creates the ARView on demand).
+private struct ARLayer: UIViewRepresentable {
+    let controller: ARController
+
+    func makeUIView(context: Context) -> UIView { controller.container }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
 }
 
 private struct ErrorPanel: View {

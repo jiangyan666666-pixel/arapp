@@ -2,91 +2,41 @@
 // each trial, so it must be settable to the millimetre without any UI showing it.
 //
 // Two kinds of models:
-//   - procedural: rebuilt from boxes at the requested width (shelf, sideboard)
+//   - procedural: rebuilt from boxes at the requested width (shelf, sideboard); the numbers
+//     live in furniture-spec.js, shared with the native AR layer
 //   - gltf: a CC0 model scaled along X only, about its centre, from its nominal width
 //     (a few cm either way is visually acceptable for shelves/cabinets)
 
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { COLORS, MODELS, ROUGHNESS, furnitureBoxes } from './furniture-spec.js';
 
-export const MODELS = [
-  { id: 'shelf', label: '书架（高 180 · 深 30）', kind: 'procedural', height: 1.8, depth: 0.3 },
-  { id: 'sideboard', label: '矮柜（高 80 · 深 40）', kind: 'procedural', height: 0.8, depth: 0.4 },
-  // A CC0 glTF goes here (Poly Haven / Sketchfab CC0). Put the file in public/models/.
-  // { id: 'ph-shelf', label: 'Poly Haven 书架', kind: 'gltf', url: '/models/shelf.glb', nominalWidth: 0.8 },
-];
+export { MODELS };
 
-const WOOD = 0xb08968;
-const WOOD_DARK = 0x6e4b2a;
+const WOOD = COLORS.wood;
+const WOOD_DARK = COLORS.dark;
 
-function box(w, h, d, material) {
-  return new THREE.Mesh(new THREE.BoxGeometry(w, h, d), material);
-}
-
-function buildShelf(w, def, mats) {
-  const { height: h, depth: d } = def;
-  const t = 0.018;
+/** The boxes of furniture-spec.js as three.js meshes. mats: {wood, dark}. */
+function buildGroup(modelId, width, mats) {
   const g = new THREE.Group();
-  const left = box(t, h, d, mats.wood);
-  left.position.set(-(w - t) / 2, h / 2, 0);
-  const right = left.clone();
-  right.position.x = (w - t) / 2;
-  const top = box(w - 2 * t, t, d, mats.wood);
-  top.position.set(0, h - t / 2, 0);
-  const bottom = top.clone();
-  bottom.position.y = 0.06 + t / 2;
-  const plinth = box(w - 2 * t, 0.06, d - 0.04, mats.dark);
-  plinth.position.set(0, 0.03, -0.02);
-  const back = box(w - 2 * t, h - 2 * t, 0.006, mats.dark);
-  back.position.set(0, h / 2, -d / 2 + 0.003);
-  g.add(left, right, top, bottom, plinth, back);
-  const nShelves = Math.max(1, Math.round(h / 0.38) - 1);
-  const y0 = 0.06 + t;
-  const y1 = h - t;
-  for (let i = 1; i <= nShelves; i++) {
-    const shelf = box(w - 2 * t, t, d - 0.012, mats.wood);
-    shelf.position.set(0, y0 + ((y1 - y0) * i) / (nShelves + 1), 0.006);
-    g.add(shelf);
+  for (const b of furnitureBoxes(modelId, width)) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(...b.size), mats[b.material]);
+    mesh.position.set(...b.position);
+    g.add(mesh);
   }
   return g;
 }
-
-function buildSideboard(w, def, mats) {
-  const { height: h, depth: d } = def;
-  const g = new THREE.Group();
-  // outer width is exactly w (the hidden trial width): the top is the widest part
-  const carcass = box(w - 0.02, h - 0.08, d - 0.02, mats.wood);
-  carcass.position.set(0, 0.08 + (h - 0.08) / 2, -0.01);
-  const top = box(w, 0.02, d, mats.dark);
-  top.position.set(0, h - 0.01, 0);
-  g.add(carcass, top);
-  for (const sx of [-1, 1]) {
-    const door = box(w / 2 - 0.03, h - 0.14, 0.012, mats.dark);
-    door.position.set((sx * w) / 4, 0.08 + (h - 0.08) / 2, d / 2 - 0.006);
-    g.add(door);
-    const leg = box(0.03, 0.08, 0.03, mats.dark);
-    leg.position.set(sx * (w / 2 - 0.04), 0.04, d / 2 - 0.04);
-    const leg2 = leg.clone();
-    leg2.position.z = -d / 2 + 0.04;
-    g.add(leg, leg2);
-  }
-  return g;
-}
-
-const BUILDERS = { shelf: buildShelf, sideboard: buildSideboard };
 
 /**
  * A procedural model at an exact outer width (metres), origin at the bottom centre,
  * front facing +Z. No DOM needed, so it also runs in Node (tools/make_usdz.mjs).
  */
 export function buildFurnitureGroup(modelId, width) {
-  const model = MODELS.find((m) => m.id === modelId && m.kind === 'procedural');
-  if (!model) throw new Error(`no procedural model "${modelId}"`);
   const mats = {
-    wood: new THREE.MeshStandardMaterial({ color: WOOD, roughness: 0.8, metalness: 0 }),
-    dark: new THREE.MeshStandardMaterial({ color: WOOD_DARK, roughness: 0.85, metalness: 0 }),
+    wood: new THREE.MeshStandardMaterial({ color: WOOD, roughness: ROUGHNESS.wood, metalness: 0 }),
+    dark: new THREE.MeshStandardMaterial({ color: WOOD_DARK, roughness: ROUGHNESS.dark, metalness: 0 }),
   };
-  return BUILDERS[model.id](width, model, mats);
+  return buildGroup(modelId, width, mats);
 }
 
 function blobShadowTexture() {
@@ -169,7 +119,7 @@ export class Furniture {
       this.gltfScene.scale.set(metres / this.nominalWidth, 1, 1);
       this.inner.add(this.gltfScene);
     } else {
-      this.inner.add(BUILDERS[this.model.id](metres, this.model, this.mats));
+      this.inner.add(buildGroup(this.model.id, metres, this.mats));
     }
     this.rebuildExtras();
   }
