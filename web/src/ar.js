@@ -20,8 +20,8 @@ export const DEFAULTS = {
   verticalPlanes: true,
   reset: true,
   // what is drawn (can change any time with setOptions)
-  personOcclusion: true,
-  meshOcclusion: false,
+  personOcclusion: true, // the hand hides the furniture behind it
+  meshOcclusion: true, // real objects (LiDAR mesh) hide the furniture behind them – a feature of the tool (decided 2026-11-17)
   disable: ['motionBlur', 'depthOfField'], // keep the furniture's edges sharp
   debug: [],
   statusHz: 4,

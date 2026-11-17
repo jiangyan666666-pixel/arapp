@@ -66,7 +66,7 @@ const rt = {
   busy: false,
   placed: null, // {position, yaw, width, modelId}
   wantWidth: SHELF_W,
-  meshOcclusion: false,
+  meshOcclusion: true, // real objects hide the furniture: part of the tool since 2026-11-17 (Jiang)
   personOcclusion: true,
   showMesh: false,
   shadow: true,
@@ -322,6 +322,21 @@ function arBlock() {
 
 const notPlaced = () => !rt.placed && line('书架还没放：先在画面上点一下地面。', 'badc');
 
+/** Fine adjustment after the tap: 1 cm / 1° per press, along the shelf's own axes. */
+function nudgeRow() {
+  const b = (label, dx, dz, dyaw) => h('button', { disabled: !rt.placed, onclick: () => nudge(dx, dz, dyaw) }, label);
+  return h(
+    'div',
+    { class: 'row tight' },
+    b('← 左', -0.01, 0, 0),
+    b('右 →', 0.01, 0, 0),
+    b('往里', 0, -0.01, 0),
+    b('往外', 0, 0.01, 0),
+    b('↺', 0, 0, Math.PI / 180),
+    b('↻', 0, 0, -Math.PI / 180),
+  );
+}
+
 const STEPS = [
   {
     id: 'prep',
@@ -390,9 +405,9 @@ const STEPS = [
     ar: true,
     text: () => [
       p('慢慢左右移动手机，让它看到地面。然后在画面上点一下 1.5–2 米外的地面。'),
-      p('一个宽 80、高 180、深 30 cm 的书架会站在那里，正面朝你。位置不好就再点一次。'),
+      p('一个宽 80、高 180、深 30 cm 的书架会站在那里，正面朝你。位置差得多就再点一次；差一点或者歪了，用下面的按钮挪（每按一下 1 cm 或 1°）。'),
     ],
-    controls: () => [h('button', { class: 'primary', disabled: !rt.placed, onclick: () => go(st.step + 1) }, rt.placed ? '放好了，下一步' : '先点一下地面')],
+    controls: () => [nudgeRow(), h('button', { class: 'primary', disabled: !rt.placed, onclick: () => go(st.step + 1) }, rt.placed ? '放好了，下一步' : '先点一下地面')],
   },
   {
     id: 'q1',
@@ -416,7 +431,7 @@ const STEPS = [
     title: '③ 尺寸',
     ar: true,
     text: () => [
-      p('把卷尺拉开，平放在地上，紧贴书架正面的底边。'),
+      p('把卷尺拉开，平放在地上。用下面的按钮把书架挪到正面的底边紧贴卷尺、和卷尺平行（每按一下 1 cm 或 1°）。'),
       p('从手机里看：书架的左下角、右下角各对到卷尺的多少厘米？尽量从角的正上方看，斜着看会偏。'),
     ],
     controls: () => {
@@ -434,6 +449,7 @@ const STEPS = [
       };
       return [
         notPlaced(),
+        nudgeRow(),
         h(
           'div',
           { class: 'row' },
@@ -465,7 +481,6 @@ const STEPS = [
     controls: () => {
       const w = num('q5:gap');
       const applied = st.answers.q5gap?.gap_cm;
-      const nudgeButton = (label, dx, dz, dyaw) => h('button', { disabled: !rt.placed, onclick: () => nudge(dx, dz, dyaw) }, label);
       return [
         h(
           'div',
@@ -490,16 +505,7 @@ const STEPS = [
           ),
         ),
         applied != null && line(`现在的书架宽 ${applied + 6} cm（空隙 ${applied} cm）${w != null && w !== applied ? '。宽度改了，要再点一次「用这个宽度」' : ''}`),
-        h(
-          'div',
-          { class: 'row tight' },
-          nudgeButton('← 左', -0.01, 0, 0),
-          nudgeButton('右 →', 0.01, 0, 0),
-          nudgeButton('往里', 0, -0.01, 0),
-          nudgeButton('往外', 0, 0.01, 0),
-          nudgeButton('↺', 0, 0, Math.PI / 180),
-          nudgeButton('↻', 0, 0, -Math.PI / 180),
-        ),
+        nudgeRow(),
         h('button', { class: 'primary', disabled: !rt.placed || applied == null, onclick: () => go(st.step + 1) }, '摆好了，下一步'),
       ];
     },
