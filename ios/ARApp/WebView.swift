@@ -6,14 +6,19 @@ import WebKit
 // a page has no background, the AR picture underneath shows through (ContentView). The web
 // view is on top and gets every touch; the AR layer has no gestures.
 //
-// Messages (web/src/native.js):
+// Messages (web/src/native.js; docs/protocol.md is the contract):
 //   web → native: window.webkit.messageHandlers.native.postMessage({type, id, payload})
 //   native → web: window.__fromNative({id, ...reply})      reply to one message
-//                 window.__nativeEvent({type, ...})        unasked, e.g. "ar.status"
+//                 window.__nativeEvent({type, ...})        unasked, e.g. "ar.status", "ar.hands"
+// A message without an id (or with id null) gets no reply: fire-and-forget for what the page
+// sends every frame (ar.updateGroups via postNative()).
 // Types: "ping" → {type: "pong", echo: payload}; "status" → AppModel.status();
-//        "openSettings" → shows the server-address screen; "ar.*" → ARController.
+//        "openSettings" → shows the server-address screen; "haptic" → Haptics (works without AR);
+//        "ar.*" → ARController (session, raycast, capture, depth, planes, light), its
+//        HandTracker (ar.hands) and BoxGroups (ar.setGroup … ar.groups, ar.*Furniture).
 // Before any page script runs,
-//   window.__nativeInfo = {version, buildTime, label, ios, model, features: ["ar"]}.
+//   window.__nativeInfo = {version, buildTime, label, ios, model, features}
+// with features = ["ar", "hands", "groups", "planes", "depth", "haptic", "light"].
 struct WebView: UIViewRepresentable {
     let model: AppModel
 
@@ -49,6 +54,9 @@ struct WebView: UIViewRepresentable {
 
     func updateUIView(_ uiView: WKWebView, context: Context) {}
 
+    /// What this app can do; pages check before using a stage-3 message (hasFeature in native.js).
+    static let features = ["ar", "hands", "groups", "planes", "depth", "haptic", "light"]
+
     private static func infoScript() -> String {
         let info: [String: Any] = [
             "version": BuildInfo.commit,
@@ -56,7 +64,7 @@ struct WebView: UIViewRepresentable {
             "label": BuildInfo.label,
             "ios": UIDevice.current.systemVersion,
             "model": BuildInfo.deviceModel,
-            "features": ["ar"],
+            "features": features,
         ]
         let data = (try? JSONSerialization.data(withJSONObject: info)) ?? Data("{}".utf8)
         let json = String(data: data, encoding: .utf8) ?? "{}"
@@ -144,34 +152,57 @@ struct WebView: UIViewRepresentable {
                 reply(id, ar.state())
             case "ar.raycast":
                 reply(id, ar.raycast(payload))
-            case "ar.setFurniture":
-                reply(id, ar.setFurniture(payload))
-            case "ar.moveFurniture":
-                reply(id, ar.moveFurniture(payload))
-            case "ar.clearFurniture":
-                reply(id, ar.clearFurniture())
             case "ar.capture":
                 reply(id, ar.capture(payload))
+            case "ar.depth":
+                reply(id, ar.depth(payload))
+            case "ar.planes":
+                reply(id, ar.planes())
+            case "ar.setLight":
+                reply(id, ar.setLight(payload))
+            case "ar.hands":
+                reply(id, ar.hands.configure(payload))
+            case "ar.updateGroups":
+                // Every frame, usually without an id (then there is no reply).
+                reply(id, ar.boxes.updateGroups(payload))
+            case "ar.setGroup":
+                reply(id, ar.boxes.setGroup(payload))
+            case "ar.moveGroup":
+                reply(id, ar.boxes.moveGroup(payload))
+            case "ar.removeGroup":
+                reply(id, ar.boxes.removeGroup(payload))
+            case "ar.clearGroups":
+                ar.boxes.removeAll()
+                reply(id, ["ok": true])
+            case "ar.groups":
+                reply(id, ar.boxes.listGroups())
+            case "ar.setFurniture":
+                reply(id, ar.boxes.setFurniture(payload))
+            case "ar.moveFurniture":
+                reply(id, ar.boxes.moveFurniture(payload))
+            case "ar.clearFurniture":
+                reply(id, ar.boxes.clearFurniture())
+            case "haptic":
+                reply(id, Haptics.play(payload))
             default:
-                reply(id, ["error": "unknown message type: \(type)"])
+                let name = String(type.prefix(40))
+                LogOnce.shared.log("type \(name)", "unknown message type", data: ["type": name])
+                reply(id, ["error": "unknown message type: \(name)"])
             }
         }
 
         /// An event the page did not ask for: window.__nativeEvent(event).
         func send(event: [String: Any]) {
-            guard JSONSerialization.isValidJSONObject(event),
-                  let data = try? JSONSerialization.data(withJSONObject: event),
-                  let json = String(data: data, encoding: .utf8) else { return }
+            guard let json = Self.json(event, what: event["type"] as? String ?? "event") else { return }
             webView?.evaluateJavaScript("window.__nativeEvent && window.__nativeEvent(\(json))", completionHandler: nil)
         }
 
+        /// The reply to one message – only if it came with an id (protocol §1).
         private func reply(_ id: Any?, _ payload: [String: Any]) {
+            guard let id, !(id is NSNull) else { return }
             var message = payload
-            message["id"] = id ?? NSNull()
-            guard JSONSerialization.isValidJSONObject(message),
-                  let data = try? JSONSerialization.data(withJSONObject: message),
-                  let json = String(data: data, encoding: .utf8) else {
-                NativeLog.shared.log("could not encode reply", level: "error")
+            message["id"] = id
+            guard let json = Self.json(message, what: "reply") else {
                 if let number = id as? NSNumber {
                     // Still answer, so the page does not wait for its timeout.
                     webView?.evaluateJavaScript("window.__fromNative && window.__fromNative({id: \(number.intValue), error: 'native could not encode the reply'})", completionHandler: nil)
@@ -179,6 +210,24 @@ struct WebView: UIViewRepresentable {
                 return
             }
             webView?.evaluateJavaScript("window.__fromNative && window.__fromNative(\(json))", completionHandler: nil)
+        }
+
+        /// JSON text, or nil. JSONSerialization refuses NaN and infinity; numbers are rounded
+        /// before they get here, but if one slips through it is sent as 0 (logged once per kind
+        /// of message) rather than the whole message silently disappearing.
+        private static func json(_ object: [String: Any], what: String) -> String? {
+            var value: Any = object
+            if !JSONSerialization.isValidJSONObject(value) {
+                value = jsonSafe(object)
+                LogOnce.shared.log("json \(what)", "message had values JSON cannot hold; sent with 0 instead", level: "error", data: ["message": what])
+            }
+            guard JSONSerialization.isValidJSONObject(value),
+                  let data = try? JSONSerialization.data(withJSONObject: value),
+                  let json = String(data: data, encoding: .utf8) else {
+                NativeLog.shared.log("could not encode a message", level: "error", data: ["message": what])
+                return nil
+            }
+            return json
         }
     }
 }

@@ -2,24 +2,31 @@ import ARKit
 import AVFoundation
 import CoreImage
 import ImageIO
+import QuartzCore
 import RealityKit
 import UIKit
 
 // The native AR layer under the transparent web page: camera, world tracking, LiDAR, occlusion,
-// and the furniture. It is deliberately thin and has no logic of its own – the page decides
-// everything (where the furniture goes, which options are on) and tells it through messages
-// (WebView.swift routes "ar.*" here; web/src/ar.js is the other end):
+// Vision hand pose and the boxes the page asks for. It is deliberately thin and has no logic of
+// its own – the page decides everything and tells it through messages (docs/protocol.md is the
+// contract; WebView.swift routes the messages here; web/src/ar.js is the other end):
 //
 //   ar.start {…options}        → runs the session (asks for camera permission the first time)
-//   ar.stop
-//   ar.setOptions {…options}   → occlusion switches, render and debug options
-//   ar.raycast {x, y, allowing, alignment}   x, y in 0..1 of the screen → hits in world space
-//   ar.setFurniture {boxes, position, yaw, shadow}   boxes from web/src/furniture-spec.js
-//   ar.moveFurniture {position, yaw}
-//   ar.clearFurniture
-//   ar.capture {…what to include}   → one frame: LiDAR depth, camera pose, image, mesh
+//   ar.stop                    → pauses it; removes all groups and the light; hands pause
+//   ar.setOptions {…options}   → occlusion switches, render and debug options, planes, hands
 //   ar.state
-// and it sends "ar.status" events a few times a second (camera pose, tracking, what ARKit sees).
+//   ar.raycast {x, y, allowing, alignment}   x, y in 0..1 of the screen → hits in world space
+//   ar.capture {…what to include}   → one frame: LiDAR depth, camera pose, image, mesh, hands
+//   ar.depth {rect?, step?, personDepth?}    → a piece of the LiDAR map (§7)
+//   ar.planes                  → the detected planes (§6)
+//   ar.setLight {on, direction?, intensity?, shadow?, shadowDistance?, color?}   (§8)
+//   ar.hands {…config}         → HandTracker.swift (§4)
+//   ar.setGroup / ar.updateGroups / ar.moveGroup / ar.removeGroup / ar.clearGroups / ar.groups
+//                              → BoxGroups.swift (§5)
+//   ar.setFurniture / ar.moveFurniture / ar.clearFurniture   stage 2: the group "furniture"
+// and it sends events: "ar.status" a few times a second (camera pose, tracking, what ARKit sees,
+// fps, heat, hand and box-update timing), "ar.hands" per processed camera frame, "ar.planes"
+// when the planes change, "ar.error", "ar.interrupted".
 //
 // There are no gestures: the web page is on top and gets every touch.
 // World space: metres, Y up (gravity), right-handed. Matrices are 16 numbers, column-major.
@@ -31,33 +38,60 @@ final class ARController: NSObject, ARSessionDelegate {
     /// Sends an event to the page.
     var emit: (([String: Any]) -> Void)?
 
+    /// Vision hand pose on the camera frames.
+    let hands: HandTracker
+    /// The boxes the page draws, the stage-2 furniture among them.
+    let boxes: BoxGroups
+
     private var arView: ARView?
     private var origin: AnchorEntity?
     private var running = false
-
-    private var furniture: Entity?
-    private var furnitureAnchor: ARAnchor?
-    private var followAnchor = true
-    private var anchorUpdates = 0
-    private var anchorShift: Float = 0
+    private var light: DirectionalLight?
 
     private var statusInterval: TimeInterval = 0.25
     private var lastStatusTime: TimeInterval = 0
     private var framesSinceStart = 0
+    private var frameTimes = RecentValues(span: 1)
+    private var planeEvents = true
+    private var planesInterval: TimeInterval = 0.5
+    private var planesDirty = false
+    private var lastPlanesTime: TimeInterval = 0
     private var started: [String: Any] = [:]
     private lazy var ciContext = CIContext()
+    private var thermalObserver: NSObjectProtocol?
+
+    /// ar.start / ar.setOptions keys (protocol §2). Others are logged once and ignored.
+    private static let optionKeys: Set<String> = [
+        "personSegmentationWithDepth", "sceneDepth", "smoothedSceneDepth", "sceneReconstruction",
+        "horizontalPlanes", "verticalPlanes", "reset",
+        "personOcclusion", "meshOcclusion", "disable", "debug", "statusHz", "followAnchor",
+        "meshReceivesLighting", "planeEvents", "planesHz", "hands",
+    ]
+    private static let lightKeys: Set<String> = ["on", "direction", "intensity", "shadow", "shadowDistance", "color"]
+    private static let depthKeys: Set<String> = ["rect", "step", "personDepth"]
 
     override init() {
         container = UIView()
         container.backgroundColor = .black
         container.isUserInteractionEnabled = false
+        hands = HandTracker()
+        boxes = BoxGroups()
         super.init()
+        hands.emit = { [weak self] event in self?.emit?(event) }
+        // The phone gets hot with LiDAR + mesh + Vision running; the PC's log shows when.
+        thermalObserver = NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: .main
+        ) { _ in
+            logAnyThread("thermal state changed", data: ["thermal": thermalText(ProcessInfo.processInfo.thermalState)])
+        }
     }
 
     // MARK: session
 
     func start(_ options: [String: Any]) async -> [String: Any] {
         NativeLog.shared.log("ar start: requested")
+        logUnknownKeys(options, known: Self.optionKeys, in: "ar.start")
+        if let problem = checkHandsOption(options) { return ["error": problem] }
         guard ARWorldTrackingConfiguration.isSupported else {
             return ["error": "ar-unsupported"]
         }
@@ -111,12 +145,12 @@ final class ARController: NSObject, ARSessionDelegate {
 
         let view = ensureView()
         view.isHidden = false
-        apply(options)
+        _ = apply(options) // cannot fail: the only failing option (hands) was checked above
 
         var runOptions: ARSession.RunOptions = []
         if flag(options, "reset", true) {
             runOptions = [.resetTracking, .removeExistingAnchors, .resetSceneReconstruction]
-            removeFurniture()
+            boxes.removeAll()
         }
         started = [
             "ok": true,
@@ -124,23 +158,35 @@ final class ARController: NSObject, ARSessionDelegate {
             "frameSemantics": used,
             "skippedSemantics": skipped,
             "sceneReconstruction": meshOn,
-            "viewport": [Double(view.bounds.width), Double(view.bounds.height)],
+            "viewport": list(view.bounds.size),
+            "vision": ["handPose": true],
         ]
-        NativeLog.shared.log("ar start: running the session", data: started)
+        var logged = started
+        logged["thermal"] = thermalText(ProcessInfo.processInfo.thermalState)
+        logged["hands"] = hands.config.json
+        NativeLog.shared.log("ar start: running the session", data: logged)
         framesSinceStart = 0
         lastStatusTime = 0
+        frameTimes = RecentValues(span: 1)
+        planesDirty = true
+        lastPlanesTime = 0
         view.session.run(config, options: runOptions)
         running = true
+        hands.sessionStarted()
         UIApplication.shared.isIdleTimerDisabled = true
         NativeLog.shared.log("ar start: session.run returned")
         return started
     }
 
     func stop() -> [String: Any] {
-        guard let view = arView, running else { return ["ok": true, "wasRunning": false] }
+        guard let view = arView else { return ["ok": true, "wasRunning": false] }
+        // A new page starts from nothing: no boxes, no light. The hands config is kept.
+        boxes.removeAll()
+        removeLight()
+        hands.sessionStopped()
+        guard running else { return ["ok": true, "wasRunning": false] }
         view.session.pause()
         running = false
-        removeFurniture()
         view.isHidden = true
         UIApplication.shared.isIdleTimerDisabled = false
         NativeLog.shared.log("ar stopped")
@@ -149,17 +195,25 @@ final class ARController: NSObject, ARSessionDelegate {
 
     func setOptions(_ options: [String: Any]) -> [String: Any] {
         guard arView != nil else { return ["error": "ar-not-started"] }
-        apply(options)
+        logUnknownKeys(options, known: Self.optionKeys, in: "ar.setOptions")
+        if let problem = apply(options) { return ["error": problem] }
         return state()
     }
 
     func state() -> [String: Any] {
-        guard let view = arView else { return ["ok": true, "running": false] }
+        guard let view = arView else { return ["ok": true, "running": false, "hands": hands.config.json] }
         var result = started
         result["running"] = running
         result["meshOcclusion"] = view.environment.sceneUnderstanding.options.contains(.occlusion)
+        result["meshReceivesLighting"] = view.environment.sceneUnderstanding.options.contains(.receivesLighting)
         result["personOcclusion"] = !view.renderOptions.contains(.disablePersonOcclusion)
-        result["hasFurniture"] = furniture != nil
+        result["hasFurniture"] = boxes.has(BoxGroups.furnitureID)
+        result["hands"] = hands.config.json
+        result["groups"] = boxes.count
+        result["light"] = light != nil
+        result["planeEvents"] = planeEvents
+        result["planesHz"] = round3(1 / planesInterval)
+        result["followAnchor"] = boxes.followAnchor
         return result
     }
 
@@ -172,15 +226,25 @@ final class ARController: NSObject, ARSessionDelegate {
         let anchor = AnchorEntity(world: matrix_identity_float4x4)
         view.scene.addAnchor(anchor)
         origin = anchor
+        boxes.attach(root: anchor, session: view.session)
         view.session.delegate = self
         arView = view
         return view
     }
 
+    /// nil, or why the "hands" option is not a valid ar.hands config.
+    private func checkHandsOption(_ options: [String: Any]) -> String? {
+        guard let h = given(options, "hands") else { return nil }
+        guard let config = h as? [String: Any] else { return "hands: an ar.hands config object" }
+        return hands.check(config).map { "hands: \($0)" }
+    }
+
     /// The options that can change while the session runs. Keys that are absent stay as they are.
-    private func apply(_ options: [String: Any]) {
-        guard let view = arView else { return }
-        // Real objects (the LiDAR mesh) hide the furniture behind them.
+    /// Returns why it refused (only a bad "hands" config; then nothing is changed).
+    private func apply(_ options: [String: Any]) -> String? {
+        guard let view = arView else { return nil }
+        if let problem = checkHandsOption(options) { return problem }
+        // Real objects (the LiDAR mesh) hide the virtual boxes behind them.
         if let on = options["meshOcclusion"] as? Bool {
             if on {
                 view.environment.sceneUnderstanding.options.insert(.occlusion)
@@ -188,7 +252,15 @@ final class ARController: NSObject, ARSessionDelegate {
                 view.environment.sceneUnderstanding.options.remove(.occlusion)
             }
         }
-        // People (the hand) hide the furniture behind them.
+        // Virtual lights light the LiDAR mesh, so virtual objects cast shadows on real things.
+        if let on = options["meshReceivesLighting"] as? Bool {
+            if on {
+                view.environment.sceneUnderstanding.options.insert(.receivesLighting)
+            } else {
+                view.environment.sceneUnderstanding.options.remove(.receivesLighting)
+            }
+        }
+        // People (the hand) hide the virtual boxes behind them.
         if let on = options["personOcclusion"] as? Bool {
             if on {
                 view.renderOptions.remove(.disablePersonOcclusion)
@@ -227,16 +299,27 @@ final class ARController: NSObject, ARSessionDelegate {
             statusInterval = 1 / min(hz, 30)
         }
         if let follow = options["followAnchor"] as? Bool {
-            followAnchor = follow
+            boxes.followAnchor = follow
         }
+        if let on = options["planeEvents"] as? Bool {
+            planeEvents = on
+            if on { planesDirty = true }
+        }
+        if let hz = number(options["planesHz"]), hz > 0 {
+            planesInterval = 1 / min(hz, 30)
+        }
+        if let config = given(options, "hands") as? [String: Any] {
+            _ = hands.configure(config) // checked above
+        }
+        return nil
     }
 
     // MARK: raycast
 
     func raycast(_ p: [String: Any]) -> [String: Any] {
         guard let view = arView, running else { return ["error": "ar-not-running"] }
-        let x = number(p["x"]) ?? 0.5
-        let y = number(p["y"]) ?? 0.5
+        let x = min(max(number(p["x"]) ?? 0.5, -10), 10)
+        let y = min(max(number(p["y"]) ?? 0.5, -10), 10)
         let point = CGPoint(x: x * Double(view.bounds.width), y: y * Double(view.bounds.height))
 
         let target: ARRaycastQuery.Target
@@ -271,71 +354,6 @@ final class ARController: NSObject, ARSessionDelegate {
         return reply
     }
 
-    // MARK: furniture
-
-    /// boxes: [{size: [w, h, d], position: [x, y, z], color: [r, g, b] 0..1 sRGB, roughness}],
-    /// in the furniture's own space (origin bottom centre, front +Z). Then position + yaw in world.
-    func setFurniture(_ p: [String: Any]) -> [String: Any] {
-        guard arView != nil, let origin = origin else { return ["error": "ar-not-started"] }
-        guard let boxes = p["boxes"] as? [[String: Any]], !boxes.isEmpty, boxes.count <= 200 else {
-            return ["error": "bad-boxes"]
-        }
-        let shadow = flag(p, "shadow", true)
-        let root = Entity()
-        for box in boxes {
-            guard let size = vector(box["size"]), let position = vector(box["position"]),
-                  size.x > 0, size.y > 0, size.z > 0 else {
-                return ["error": "bad-box"]
-            }
-            let rgb = vector(box["color"]) ?? SIMD3<Float>(0.7, 0.55, 0.4)
-            let color = UIColor(red: CGFloat(rgb.x), green: CGFloat(rgb.y), blue: CGFloat(rgb.z), alpha: 1)
-            let roughness = Float(number(box["roughness"]) ?? 0.8)
-            let material = SimpleMaterial(color: color, roughness: .float(roughness), isMetallic: false)
-            let mesh = MeshResource.generateBox(width: size.x, height: size.y, depth: size.z)
-            let entity = ModelEntity(mesh: mesh, materials: [material])
-            entity.position = position
-            if shadow {
-                entity.components.set(GroundingShadowComponent(castsShadow: true))
-            }
-            root.addChild(entity)
-        }
-        removeFurniture()
-        origin.addChild(root)
-        furniture = root
-        return moveFurniture(p)
-    }
-
-    func moveFurniture(_ p: [String: Any]) -> [String: Any] {
-        guard let view = arView, let root = furniture else { return ["error": "no-furniture"] }
-        guard let position = vector(p["position"]) else { return ["error": "bad-position"] }
-        let yaw = Float(number(p["yaw"]) ?? 0)
-        let transform = Transform(scale: .one, rotation: simd_quatf(angle: yaw, axis: SIMD3<Float>(0, 1, 0)), translation: position)
-        root.transform = transform
-        // An ARKit anchor at the same pose: when ARKit corrects its map, the anchor moves with
-        // the real surroundings, and the furniture follows it (session(_:didUpdate anchors:)).
-        if let old = furnitureAnchor { view.session.remove(anchor: old) }
-        let anchor = ARAnchor(name: "furniture", transform: transform.matrix)
-        view.session.add(anchor: anchor)
-        furnitureAnchor = anchor
-        anchorUpdates = 0
-        anchorShift = 0
-        return ["ok": true]
-    }
-
-    func clearFurniture() -> [String: Any] {
-        removeFurniture()
-        return ["ok": true]
-    }
-
-    private func removeFurniture() {
-        furniture?.removeFromParent()
-        furniture = nil
-        if let anchor = furnitureAnchor {
-            arView?.session.remove(anchor: anchor)
-        }
-        furnitureAnchor = nil
-    }
-
     // MARK: capture
 
     /// One frame for tuning algorithms on the PC. Everything is in the camera sensor's own
@@ -355,16 +373,15 @@ final class ARController: NSObject, ARSessionDelegate {
             "camera": [
                 "transform": list(camera.transform),
                 "intrinsics": list(camera.intrinsics),
-                "imageResolution": [Double(camera.imageResolution.width), Double(camera.imageResolution.height)],
-                "viewport": [Double(viewport.width), Double(viewport.height)],
+                "imageResolution": list(camera.imageResolution),
+                "viewport": list(viewport),
                 "projectionPortrait": list(camera.projectionMatrix(for: .portrait, viewportSize: viewport, zNear: 0.01, zFar: 100)),
                 "viewMatrixPortrait": list(camera.viewMatrix(for: .portrait)),
-                "displayTransform": [Double(display.a), Double(display.b), Double(display.c), Double(display.d), Double(display.tx), Double(display.ty)],
+                "displayTransform": list(display),
             ],
         ]
-        if let root = furniture {
-            // pose only – never the size (blind test)
-            out["furniture"] = ["position": list(root.position), "transform": list(root.transform.matrix)]
+        if let pose = boxes.furniturePose() {
+            out["furniture"] = pose // pose only – never the size (blind test)
         }
 
         if flag(p, "depth", true) {
@@ -385,9 +402,9 @@ final class ARController: NSObject, ARSessionDelegate {
             if let estimated = frame.estimatedDepthData { out["personDepth"] = encode(estimated) }
         }
         if flag(p, "image", true) {
-            let maxWidth = number(p["imageMaxWidth"]) ?? 960
+            let maxWidth = min(max(number(p["imageMaxWidth"]) ?? 960, 16), 4096)
             let image = CIImage(cvPixelBuffer: frame.capturedImage)
-            let scale = min(1, maxWidth / Double(image.extent.width))
+            let scale = image.extent.width > 0 ? min(1, maxWidth / Double(image.extent.width)) : 1
             let scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             let qualityKey = CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String)
             let quality: [CIImageRepresentationOption: Any] = [qualityKey: 0.75]
@@ -400,22 +417,24 @@ final class ARController: NSObject, ARSessionDelegate {
                 ]
             }
         }
+        var handCount = 0
+        if flag(p, "hands", true) {
+            // Vision on this very frame, on the main thread, with the same joint format and
+            // depth samples as the ar.hands events.
+            let found = hands.capture(frame, viewport: viewport)
+            for (key, value) in found { out[key] = value }
+            handCount = (found["hands"] as? [Any])?.count ?? 0
+            out["handsConfig"] = hands.config.json
+        }
 
         var planes: [[String: Any]] = []
         var meshes: [[String: Any]] = []
         let wantMesh = flag(p, "mesh", false)
-        let radius = Float(number(p["meshRadius"]) ?? 4)
+        let radius = Float(min(max(number(p["meshRadius"]) ?? 4, 0), 100))
         let eye = camera.transform.columns.3
         for anchor in frame.anchors {
             if let plane = anchor as? ARPlaneAnchor {
-                planes.append([
-                    "alignment": plane.alignment == .horizontal ? "horizontal" : "vertical",
-                    "class": planeClass(plane.classification),
-                    "transform": list(plane.transform),
-                    "center": list(plane.center),
-                    "extent": [round5(plane.planeExtent.width), round5(plane.planeExtent.height)],
-                    "rotationOnYAxis": round5(plane.planeExtent.rotationOnYAxis),
-                ])
+                planes.append(planeJSON(plane))
             } else if wantMesh, let mesh = anchor as? ARMeshAnchor {
                 let at = mesh.transform.columns.3
                 if simd_distance(SIMD3<Float>(at.x, at.y, at.z), SIMD3<Float>(eye.x, eye.y, eye.z)) > radius { continue }
@@ -441,6 +460,7 @@ final class ARController: NSObject, ARSessionDelegate {
             "depth": out["depthSource"] ?? "not asked",
             "planes": planes.count,
             "meshes": meshes.count,
+            "hands": handCount,
         ])
         return out
     }
@@ -450,7 +470,9 @@ final class ARController: NSObject, ARSessionDelegate {
         let format = CVPixelBufferGetPixelFormatType(buffer)
         let name = fourCC(format)
         if CVPixelBufferIsPlanar(buffer) { return ["error": "planar pixel buffer", "format": name] }
-        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        guard CVPixelBufferLockBaseAddress(buffer, .readOnly) == kCVReturnSuccess else {
+            return ["error": "could not lock pixel buffer", "format": name]
+        }
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
         let width = CVPixelBufferGetWidth(buffer)
         let height = CVPixelBufferGetHeight(buffer)
@@ -467,6 +489,9 @@ final class ARController: NSObject, ARSessionDelegate {
         default:
             bytesPerPixel = max(1, rowBytes / width)
         }
+        guard rowBytes >= width * bytesPerPixel else {
+            return ["error": "pixel buffer rows shorter than expected", "format": name]
+        }
         var data = Data(capacity: width * height * bytesPerPixel)
         for row in 0..<height {
             let line = base.advanced(by: row * rowBytes).assumingMemoryBound(to: UInt8.self)
@@ -481,11 +506,239 @@ final class ARController: NSObject, ARSessionDelegate {
         ]
     }
 
-    // MARK: ARSessionDelegate
+    // MARK: depth on request (§7)
 
-    func session(_ session: ARSession, didUpdate frame: ARFrame) {
+    /// ar.depth {rect?: [x0, y0, x1, y1] image coordinates, step?: 2, personDepth?: false}
+    /// → {ok, t, camera, display, viewport, depthSize, rect: [u0, v0, u1, v1], step, w, h,
+    ///    depth, info, personDepth?}. The step is raised if needed to stay within the whole map
+    ///    (49 152 pixels).
+    func depth(_ p: [String: Any]) -> [String: Any] {
+        guard let view = arView, running, let frame = view.session.currentFrame else {
+            return ["error": "ar-not-running"]
+        }
+        logUnknownKeys(p, known: Self.depthKeys, in: "ar.depth")
+        guard let lidar = frame.sceneDepth ?? frame.smoothedSceneDepth else { return ["error": "no-depth"] }
+        var rect: [Double] = [0, 0, 1, 1]
+        if let v = given(p, "rect") {
+            guard let r = numbers(v, count: 4) else { return ["error": "rect: [x0, y0, x1, y1] in 0..1"] }
+            rect = r.map { min(max($0, 0), 1) }
+        }
+        var step = 2
+        if let v = given(p, "step") {
+            guard let s = integer(v), s >= 1 else { return ["error": "step: 1 or more"] }
+            step = min(s, 64)
+        }
+        let wantPD: Bool
+        do {
+            wantPD = try optionalBool(p, "personDepth") ?? false
+        } catch {
+            return ["error": errorText(error)]
+        }
+        let maps = DepthMaps.lock(
+            depth: lidar.depthMap, confidence: lidar.confidenceMap,
+            person: frame.segmentationBuffer, personDepth: wantPD ? frame.estimatedDepthData : nil
+        )
+        defer { maps.unlock() }
+        guard let map = maps.depth else { return ["error": "depth map in an unexpected format"] }
+        let W = map.width
+        let H = map.height
+        let u0 = Int((min(rect[0], rect[2]) * Double(W)).rounded(.down))
+        let u1 = Int((max(rect[0], rect[2]) * Double(W)).rounded(.up))
+        let v0 = Int((min(rect[1], rect[3]) * Double(H)).rounded(.down))
+        let v1 = Int((max(rect[1], rect[3]) * Double(H)).rounded(.up))
+        guard u1 > u0, v1 > v0 else { return ["error": "rect: empty"] }
+        step = DepthMaps.fitStep(u1 - u0, v1 - v0, start: step, maxPixels: 49_152)
+        guard let patch = maps.patch(u0: u0, v0: v0, u1: u1, v1: v1, step: step, withPersonDepth: wantPD) else {
+            return ["error": "rect: empty"]
+        }
+        let viewport = view.bounds.size
+        var out: [String: Any] = [
+            "ok": true,
+            "t": frame.timestamp,
+            "camera": cameraJSON(transform: frame.camera.transform, intrinsics: frame.camera.intrinsics, imageResolution: frame.camera.imageResolution),
+            "display": list(frame.displayTransform(for: .portrait, viewportSize: viewport)),
+            "viewport": list(viewport),
+            "depthSize": [W, H],
+            "rect": patch.rect,
+            "step": patch.step,
+            "w": patch.w,
+            "h": patch.h,
+            "depth": patch.depth,
+            "info": patch.info,
+        ]
+        if let pd = patch.personDepth { out["personDepth"] = pd }
+        return out
+    }
+
+    // MARK: planes (§6)
+
+    /// ar.planes → {ok, planes}
+    func planes() -> [String: Any] {
+        guard let view = arView, running, let frame = view.session.currentFrame else {
+            return ["error": "ar-not-running"]
+        }
+        return ["ok": true, "planes": planeList(frame.anchors)]
+    }
+
+    private func planeList(_ anchors: [ARAnchor]) -> [[String: Any]] {
+        anchors.compactMap { $0 as? ARPlaneAnchor }.map { planeJSON($0) }
+    }
+
+    /// {id, alignment, class, transform, center, extent, rotationOnYAxis, boundary}; center and
+    /// boundary in the plane's own space, the boundary evenly thinned to at most 128 points.
+    private func planeJSON(_ plane: ARPlaneAnchor) -> [String: Any] {
+        let vertices = plane.geometry.boundaryVertices
+        let n = vertices.count
+        let take = min(n, 128)
+        var boundary: [[Double]] = []
+        boundary.reserveCapacity(take)
+        for k in 0..<take {
+            let v = vertices[take == n ? k : (k * n) / take]
+            boundary.append([round5(v.x), round5(v.z)])
+        }
+        return [
+            "id": plane.identifier.uuidString,
+            "alignment": plane.alignment == .horizontal ? "horizontal" : "vertical",
+            "class": planeClass(plane.classification),
+            "transform": list(plane.transform),
+            "center": list(plane.center),
+            "extent": [round5(plane.planeExtent.width), round5(plane.planeExtent.height)],
+            "rotationOnYAxis": round5(plane.planeExtent.rotationOnYAxis),
+            "boundary": boundary,
+        ]
+    }
+
+    // MARK: light (§8)
+
+    /// ar.setLight {on, direction?: [0.3, -1, -0.2] (the way the light travels), intensity?: 2000
+    /// lux, shadow?: true, shadowDistance?: 2, color?: [r, g, b]} → {ok}. One directional light.
+    func setLight(_ p: [String: Any]) -> [String: Any] {
+        guard let origin else { return ["error": "ar-not-started"] }
+        logUnknownKeys(p, known: Self.lightKeys, in: "ar.setLight")
+        do {
+            guard try optionalBool(p, "on") ?? true else {
+                removeLight()
+                return ["ok": true]
+            }
+            let direction = try optionalVector(p, "direction") ?? SIMD3<Float>(0.3, -1, -0.2)
+            let length = simd_length(direction)
+            guard length.isFinite, length > 1e-6 else { throw PayloadError("direction: [x, y, z], not all zero") }
+            let intensity = try optionalNumber(p, "intensity") ?? 2000
+            let shadow = try optionalBool(p, "shadow") ?? true
+            let shadowDistance = try optionalNumber(p, "shadowDistance") ?? 2
+            var rgb = SIMD3<Float>(1, 1, 1)
+            if let v = given(p, "color") {
+                guard let c = vector(v) else { throw PayloadError("color: [r, g, b] 0..1") }
+                rgb = c.clamped(lowerBound: .zero, upperBound: .one)
+            }
+
+            let entity: DirectionalLight
+            if let existing = light {
+                entity = existing
+            } else {
+                entity = DirectionalLight()
+                origin.addChild(entity)
+                light = entity
+            }
+            entity.light.intensity = Float(min(max(intensity, 0), 1_000_000))
+            entity.light.color = UIColor(red: CGFloat(rgb.x), green: CGFloat(rgb.y), blue: CGFloat(rgb.z), alpha: 1)
+            entity.shadow = shadow
+                ? DirectionalLightComponent.Shadow(maximumDistance: Float(min(max(shadowDistance, 0.1), 100)), depthBias: 1)
+                : nil
+            // A directional light shines along its forward axis (−Z); look(at:) points that axis
+            // at the target. Straight up or down needs another up vector, or the turn is undefined.
+            let d = direction / length
+            let up = abs(d.y) > 0.99 ? SIMD3<Float>(0, 0, -1) : SIMD3<Float>(0, 1, 0)
+            entity.look(at: d, from: .zero, upVector: up, relativeTo: origin)
+            NativeLog.shared.log("light set", data: [
+                "direction": list(d), "intensity": round3(intensity), "shadow": shadow,
+            ])
+            return ["ok": true]
+        } catch {
+            return ["error": errorText(error)]
+        }
+    }
+
+    private func removeLight() {
+        light?.removeFromParent()
+        light = nil
+    }
+
+    // MARK: ARSessionDelegate
+    //
+    // ARKit calls these on the main queue (the session's delegateQueue is not set). They are
+    // nonisolated only because the protocol is; each one checks it really is the main thread
+    // before touching main-thread state, instead of trapping if that ever changed.
+
+    nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        guard Thread.isMainThread else { return Self.offMain("didUpdate frame") }
+        MainActor.assumeIsolated { self.frameUpdated(frame) }
+    }
+
+    nonisolated func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
+        guard Thread.isMainThread else { return Self.offMain("didAdd anchors") }
+        MainActor.assumeIsolated { self.anchorsChanged(anchors) }
+    }
+
+    nonisolated func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        guard Thread.isMainThread else { return Self.offMain("didUpdate anchors") }
+        MainActor.assumeIsolated {
+            self.boxes.anchorsUpdated(anchors)
+            self.anchorsChanged(anchors)
+        }
+    }
+
+    nonisolated func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+        guard Thread.isMainThread else { return Self.offMain("didRemove anchors") }
+        MainActor.assumeIsolated {
+            self.boxes.anchorsRemoved(anchors)
+            self.anchorsChanged(anchors)
+        }
+    }
+
+    nonisolated func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
+        let state = trackingText(camera.trackingState)
+        logAnyThread("ar tracking", data: ["state": state])
+    }
+
+    nonisolated func session(_ session: ARSession, didFailWithError error: Error) {
+        let ns = error as NSError
+        let code = ns.code
+        let text = ns.localizedDescription
+        logAnyThread("ar session failed", level: "error", data: ["code": code, "domain": ns.domain, "text": text])
+        guard Thread.isMainThread else { return Self.offMain("didFailWithError") }
+        MainActor.assumeIsolated {
+            self.running = false
+            self.hands.sessionStopped()
+            UIApplication.shared.isIdleTimerDisabled = false
+            self.emit?(["type": "ar.error", "code": code, "message": text])
+        }
+    }
+
+    nonisolated func sessionWasInterrupted(_ session: ARSession) {
+        logAnyThread("ar interrupted")
+        guard Thread.isMainThread else { return Self.offMain("sessionWasInterrupted") }
+        MainActor.assumeIsolated { self.emit?(["type": "ar.interrupted", "interrupted": true]) }
+    }
+
+    nonisolated func sessionInterruptionEnded(_ session: ARSession) {
+        logAnyThread("ar interruption ended")
+        guard Thread.isMainThread else { return Self.offMain("sessionInterruptionEnded") }
+        MainActor.assumeIsolated { self.emit?(["type": "ar.interrupted", "interrupted": false]) }
+    }
+
+    private nonisolated static func offMain(_ what: String) {
+        LogOnce.shared.log("off main \(what)", "ARKit called the delegate off the main thread; call ignored", level: "error", data: ["call": what])
+    }
+
+    private func anchorsChanged(_ anchors: [ARAnchor]) {
+        if !planesDirty && anchors.contains(where: { $0 is ARPlaneAnchor }) { planesDirty = true }
+    }
+
+    private func frameUpdated(_ frame: ARFrame) {
         guard running, let view = arView else { return }
         framesSinceStart += 1
+        frameTimes.add(0, at: frame.timestamp)
         if framesSinceStart == 60 {
             // Once per start: what this configuration really delivers on this phone.
             var data: [String: Any] = [
@@ -493,14 +746,27 @@ final class ARController: NSObject, ARSessionDelegate {
                 "smoothedSceneDepth": frame.smoothedSceneDepth != nil,
                 "personMask": frame.segmentationBuffer != nil,
                 "personDepth": frame.estimatedDepthData != nil,
-                "image": [Double(frame.camera.imageResolution.width), Double(frame.camera.imageResolution.height)],
+                "image": list(frame.camera.imageResolution),
                 "tracking": trackingText(frame.camera.trackingState),
             ]
             if let depth = frame.sceneDepth?.depthMap {
                 data["depthSize"] = [CVPixelBufferGetWidth(depth), CVPixelBufferGetHeight(depth)]
+                data["depthFormat"] = fourCC(CVPixelBufferGetPixelFormatType(depth))
+            }
+            if let mask = frame.segmentationBuffer {
+                data["personMaskSize"] = [CVPixelBufferGetWidth(mask), CVPixelBufferGetHeight(mask)]
             }
             NativeLog.shared.log("ar frame 60", data: data)
         }
+        let viewport = view.bounds.size
+        hands.offer(frame, viewport: viewport)
+
+        if planeEvents && planesDirty && frame.timestamp - lastPlanesTime >= planesInterval {
+            planesDirty = false
+            lastPlanesTime = frame.timestamp
+            emit?(["type": "ar.planes", "planes": planeList(frame.anchors)])
+        }
+
         guard frame.timestamp - lastStatusTime >= statusInterval else { return }
         lastStatusTime = frame.timestamp
 
@@ -514,100 +780,59 @@ final class ARController: NSObject, ARSessionDelegate {
                 meshes += 1
             }
         }
+        let now = CACurrentMediaTime()
         var status: [String: Any] = [
             "type": "ar.status",
             "t": frame.timestamp,
+            "now": now,
             "tracking": trackingText(frame.camera.trackingState),
             "mapping": mappingText(frame.worldMappingStatus),
             "camera": list(frame.camera.transform),
-            "projection": list(frame.camera.projectionMatrix(for: .portrait, viewportSize: view.bounds.size, zNear: 0.01, zFar: 100)),
+            "projection": list(frame.camera.projectionMatrix(for: .portrait, viewportSize: viewport, zNear: 0.01, zFar: 100)),
             "view": list(frame.camera.viewMatrix(for: .portrait)),
+            "viewport": list(viewport),
+            "display": list(frame.displayTransform(for: .portrait, viewportSize: viewport)),
+            "fps": frameTimes.times.count,
+            "thermal": thermalText(ProcessInfo.processInfo.thermalState),
             "planes": ["horizontal": horizontal, "vertical": vertical],
             "meshAnchors": meshes,
             "hasDepth": frame.sceneDepth != nil || frame.smoothedSceneDepth != nil,
+            "hands": hands.status(now: now),
+            "latency": boxes.latencyStatus(now: now),
+            "groups": boxes.anchoredStatus(),
         ]
         if let person = personSummary(frame) {
             status["person"] = person
         }
-        if let root = furniture {
-            status["furniture"] = [
-                "transform": list(root.transform.matrix),
-                "anchorUpdates": anchorUpdates,
-                "anchorShift": round5(anchorShift),
-            ]
+        if let furniture = boxes.furnitureStatus() {
+            status["furniture"] = furniture
         }
         emit?(status)
-    }
-
-    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
-        guard followAnchor, let mine = furnitureAnchor, let root = furniture else { return }
-        for anchor in anchors where anchor.identifier == mine.identifier {
-            let before = root.position
-            root.transform = Transform(matrix: anchor.transform)
-            anchorShift += simd_distance(before, root.position)
-            anchorUpdates += 1
-        }
-    }
-
-    func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
-        NativeLog.shared.log("ar tracking", data: ["state": trackingText(camera.trackingState)])
-    }
-
-    func session(_ session: ARSession, didFailWithError error: Error) {
-        let ns = error as NSError
-        NativeLog.shared.log("ar session failed", level: "error", data: ["code": ns.code, "domain": ns.domain, "text": ns.localizedDescription])
-        running = false
-        UIApplication.shared.isIdleTimerDisabled = false
-        emit?(["type": "ar.error", "code": ns.code, "message": ns.localizedDescription])
-    }
-
-    func sessionWasInterrupted(_ session: ARSession) {
-        NativeLog.shared.log("ar interrupted")
-        emit?(["type": "ar.interrupted", "interrupted": true])
-    }
-
-    func sessionInterruptionEnded(_ session: ARSession) {
-        NativeLog.shared.log("ar interruption ended")
-        emit?(["type": "ar.interrupted", "interrupted": false])
     }
 
     /// How much of the picture ARKit sees as a person (the hand), and how far away:
     /// {fraction 0..1, nearest, mean} in metres. nil without person segmentation.
     private func personSummary(_ frame: ARFrame) -> [String: Any]? {
-        guard let mask = frame.segmentationBuffer,
-              CVPixelBufferGetPixelFormatType(mask) == kCVPixelFormatType_OneComponent8 else { return nil }
-        CVPixelBufferLockBaseAddress(mask, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(mask, .readOnly) }
-        let width = CVPixelBufferGetWidth(mask)
-        let height = CVPixelBufferGetHeight(mask)
-        let maskRow = CVPixelBufferGetBytesPerRow(mask)
-        guard width > 0, height > 0, let maskBase = CVPixelBufferGetBaseAddress(mask) else { return nil }
-
-        var depthBase: UnsafeMutableRawPointer?
-        var depthRow = 0
-        let depth = frame.estimatedDepthData
-        if let depth,
-           CVPixelBufferGetPixelFormatType(depth) == kCVPixelFormatType_DepthFloat32,
-           CVPixelBufferGetWidth(depth) == width, CVPixelBufferGetHeight(depth) == height {
-            CVPixelBufferLockBaseAddress(depth, .readOnly)
-            depthBase = CVPixelBufferGetBaseAddress(depth)
-            depthRow = CVPixelBufferGetBytesPerRow(depth)
+        guard let mask = PixelPlane.lock(frame.segmentationBuffer, name: "personMask", format: kCVPixelFormatType_OneComponent8, bytesPerPixel: 1) else {
+            return nil
         }
-        defer {
-            if depthBase != nil, let depth { CVPixelBufferUnlockBaseAddress(depth, .readOnly) }
+        defer { mask.unlock() }
+        var depth = PixelPlane.lock(frame.estimatedDepthData, name: "personDepth", format: kCVPixelFormatType_DepthFloat32, bytesPerPixel: 4)
+        if let d = depth, d.width != mask.width || d.height != mask.height {
+            d.unlock()
+            depth = nil
         }
+        defer { depth?.unlock() }
 
         var count = 0
         var depthCount = 0
         var sum: Float = 0
         var nearest = Float.greatestFiniteMagnitude
-        for y in 0..<height {
-            let maskLine = maskBase.advanced(by: y * maskRow).assumingMemoryBound(to: UInt8.self)
-            let depthLine = depthBase?.advanced(by: y * depthRow).assumingMemoryBound(to: Float32.self)
-            for x in 0..<width where maskLine[x] != 0 {
+        for y in 0..<mask.height {
+            for x in 0..<mask.width where mask.byte(x, y) != 0 {
                 count += 1
-                if let depthLine {
-                    let d = depthLine[x]
+                if let depth {
+                    let d = depth.float(x, y)
                     if d.isFinite && d > 0 {
                         depthCount += 1
                         sum += d
@@ -616,93 +841,11 @@ final class ARController: NSObject, ARSessionDelegate {
                 }
             }
         }
-        var result: [String: Any] = ["fraction": round5(Float(count) / Float(width * height))]
+        var result: [String: Any] = ["fraction": round5(Float(count) / Float(mask.width * mask.height))]
         if depthCount > 0 {
             result["nearest"] = round5(nearest)
             result["mean"] = round5(sum / Float(depthCount))
         }
         return result
     }
-}
-
-// MARK: - small helpers
-
-private func flag(_ options: [String: Any], _ key: String, _ fallback: Bool) -> Bool {
-    (options[key] as? Bool) ?? fallback
-}
-
-private func number(_ value: Any?) -> Double? {
-    guard let n = value as? NSNumber else { return nil }
-    let d = n.doubleValue
-    return d.isFinite ? d : nil
-}
-
-private func vector(_ value: Any?) -> SIMD3<Float>? {
-    guard let a = value as? [Any], a.count == 3,
-          let x = number(a[0]), let y = number(a[1]), let z = number(a[2]) else { return nil }
-    return SIMD3<Float>(Float(x), Float(y), Float(z))
-}
-
-/// JSON cannot hold NaN or infinity, and 5 decimals (0.01 mm) is plenty.
-private func round5(_ v: Float) -> Double {
-    v.isFinite ? (Double(v) * 100_000).rounded() / 100_000 : 0
-}
-
-private func list(_ v: SIMD3<Float>) -> [Double] {
-    [round5(v.x), round5(v.y), round5(v.z)]
-}
-
-private func list(_ v: SIMD4<Float>) -> [Double] {
-    [round5(v.x), round5(v.y), round5(v.z)]
-}
-
-private func list(_ m: simd_float4x4) -> [Double] {
-    [m.columns.0, m.columns.1, m.columns.2, m.columns.3].flatMap { [round5($0.x), round5($0.y), round5($0.z), round5($0.w)] }
-}
-
-private func list(_ m: simd_float3x3) -> [Double] {
-    [m.columns.0, m.columns.1, m.columns.2].flatMap { [round5($0.x), round5($0.y), round5($0.z)] }
-}
-
-private func trackingText(_ state: ARCamera.TrackingState) -> String {
-    switch state {
-    case .normal: return "normal"
-    case .notAvailable: return "notAvailable"
-    case .limited(let reason):
-        switch reason {
-        case .initializing: return "initializing"
-        case .excessiveMotion: return "excessiveMotion"
-        case .insufficientFeatures: return "insufficientFeatures"
-        case .relocalizing: return "relocalizing"
-        @unknown default: return "limited"
-        }
-    }
-}
-
-private func mappingText(_ status: ARFrame.WorldMappingStatus) -> String {
-    switch status {
-    case .notAvailable: return "notAvailable"
-    case .limited: return "limited"
-    case .extending: return "extending"
-    case .mapped: return "mapped"
-    @unknown default: return "unknown"
-    }
-}
-
-private func planeClass(_ c: ARPlaneAnchor.Classification) -> String {
-    switch c {
-    case .wall: return "wall"
-    case .floor: return "floor"
-    case .ceiling: return "ceiling"
-    case .table: return "table"
-    case .seat: return "seat"
-    case .window: return "window"
-    case .door: return "door"
-    default: return "none"
-    }
-}
-
-private func fourCC(_ code: OSType) -> String {
-    let bytes = [UInt8((code >> 24) & 255), UInt8((code >> 16) & 255), UInt8((code >> 8) & 255), UInt8(code & 255)]
-    return String(bytes: bytes, encoding: .ascii) ?? "\(code)"
 }
