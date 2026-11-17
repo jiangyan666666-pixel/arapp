@@ -393,6 +393,27 @@ final class HandTracker {
         processingChanged(from: was)
     }
 
+    /// ar.start on a session that is already running: with a reset the world moves, so a result
+    /// still in flight belongs to the old world. Ending and starting the run drops it (generation)
+    /// and numbers the new run from seq 1.
+    func sessionRestarted() {
+        sessionStopped()
+        sessionStarted()
+    }
+
+    /// A new page (or a reload) starts with hand tracking off and the default config, as on the
+    /// PC's pretend native layer: a page that never asked for hands must not pay for Vision at
+    /// 30 Hz, and a reloaded page must not inherit an orientation it no longer sets. A page's own
+    /// ar.stop / ar.start keeps its config (sessionStopped).
+    func resetForNewPage() {
+        let was = isProcessing
+        if config != HandsConfig() {
+            NativeLog.shared.log("hands: config back to the defaults for a new page")
+        }
+        config = HandsConfig()
+        processingChanged(from: was)
+    }
+
     private func processingChanged(from was: Bool) {
         let now = isProcessing
         guard now != was else { return }

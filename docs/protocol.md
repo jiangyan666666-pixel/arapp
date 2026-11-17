@@ -80,7 +80,7 @@ anchorShift}`. Added:
 - `fps` — ARKit frames per second over the last second.
 - `thermal` — `"nominal" | "fair" | "serious" | "critical"`.
 - `hands` — `{on, rate (hand events/s), visionMs: [mean, max], hands (count in the last result)}`.
-- `latency` — from `ar.updateGroups` messages that carried `frameT`: `{n, mean, p50, p90, max}` in
+- `latency` — `{n: 0, …}` (all zeros) when there were no samples; from `ar.updateGroups` messages that carried `frameT`: `{n, mean, p50, p90, max}` in
   **milliseconds** of `appliedTime − frameT` over the last second (camera frame captured → box
   update applied on the native side; the screen shows it on the next display frame, ≤ 1 more frame).
 - `groups` — `{id: {transform, anchorUpdates, anchorShift}}` for **anchored** groups only.
@@ -99,7 +99,7 @@ Payload (keys absent stay as they are) → reply `{ok, config, available}`:
 | `orientation` | `"right"` | the `CGImagePropertyOrientation` Vision is told (`"up"`, `"right"`, `"left"`, `"down"`); `"right"` = the picture as seen in portrait |
 | `pointTransform` | for the orientation | `[a, b, c, d, tx, ty]`: Vision's normalized point (vx, vy; origin bottom-left, in the oriented picture) → image (x, y) = `(a·vx + c·vy + tx, b·vx + d·vy + ty)`. Defaults: right `[0,-1,-1,0,1,1]`, up `[1,0,0,-1,0,1]`, left `[0,1,1,0,0,0]`, down `[-1,0,0,1,1,0]`. Overridable from the page in case the default is wrong on the device |
 | `window` | 2 | joint depth samples use a (2r+1)² window of depth pixels around the joint |
-| `minJointConfidence` | 0 | joints below this Vision confidence are still sent (with their confidence) — the page decides |
+| `minJointConfidence` | 0 | joints below this Vision confidence are still sent with x, y, c, but their six depth fields are 0 (no depth window is read) |
 | `patchEvery` | 0 | every N-th hand event also carries a depth patch around each hand (0 = never) |
 | `patchMargin` | 12 | patch = bounding box of the hand's joints (confidence > 0.1) in depth pixels, grown by this many pixels, clamped to the map |
 | `patchStep` | 1 | take every N-th depth pixel; raised automatically until w·h ≤ `patchMax` |
@@ -116,15 +116,23 @@ Payload (keys absent stay as they are) → reply `{ok, config, available}`:
   patches?: [ {hand, rect: [u0, v0, u1, v1], step, w, h, depth: b64, info: b64} ] }
 ```
 
-- Sent for every processed frame, also with `hands: []` (the hand left the picture).
+- Sent for every processed frame, also with `hands: []` (the hand left the picture). A frame on
+  which Vision fails sends nothing (logged at most every 10 s; `seq` shows the gap).
+- A new `orientation` without a `pointTransform` takes that orientation's default transform;
+  `pointTransform: null` goes back to the default. An invalid config is refused as a whole
+  (`ar.hands`, `ar.setOptions`) — `ar.start` with an invalid `hands` replies `{error: 'hands: …'}`
+  before touching the camera.
+- **A new page (or a reload) starts with hand tracking off and the default config.** A page's own
+  `ar.stop` / `ar.start` keeps its config (processing pauses and resumes). `ar.start` on a running
+  session restarts the run: a result in flight is dropped and `seq` starts again at 1.
 - `seq` counts processed frames since tracking was turned on; `tv0`/`tv1` = Vision start/end;
   `tSent` = handed to the web view.
 - Joint order (Vision names): 0 wrist; 1–4 thumbCMC, thumbMP, thumbIP, thumbTip; 5–8 indexMCP,
   PIP, DIP, Tip; 9–12 middle…; 13–16 ring…; 17–20 little….
 - Per joint: `x, y` image coordinates (§0) after `pointTransform`; `c` Vision confidence (0 =
-  not found; then x, y mean nothing); then from the depth window around (x, y):
+  not found; then x, y mean nothing); then from the depth window around (x, y) (a joint Vision did not find is nine zeros):
   `dAll` median LiDAR depth (m) of valid pixels (0 = none), `dHand` median LiDAR depth of the
-  window's **person** pixels (0 = none), `nHand` number of person pixels, `nAll` valid pixels,
+  window's **person** pixels (0 = none), `nHand` number of person pixels (valid depth or not), `nAll` valid pixels,
   `hi` fraction of window pixels with LiDAR confidence "high", `pd` median of ARKit's
   person depth (`estimatedDepthData`) over the person pixels (0 = none). Numbers are rounded to
   5 decimals (depth to 0.1 mm).
@@ -160,6 +168,18 @@ Updating poses every frame does not rebuild meshes.
   group follows the real surroundings and `ar.status.groups[id]` reports where it is now. Use
   `ar.moveGroup` for nudges so a correction is not undone. Setting an absolute pose re-anchors.
 - `shadow: true` = RealityKit grounding shadow under the group's boxes.
+- `dyaw` in `ar.moveGroup` turns about the vertical axis through the group's own origin (its
+  position does not change). A group update with both `rotation` and `yaw` uses `rotation`. Box
+  object updates also accept `roughness`, `metallic`, `edge`.
+- **Per-frame poses go to unanchored groups** (the hand). An absolute pose on an anchored group
+  re-anchors, i.e. creates and removes an ARKit anchor.
+- `ar.updateGroups` sent with an id: invalid parts are skipped, the valid ones applied, and the
+  reply is `{error: 'N update(s) skipped: …'}`; without an id problems are only logged (at most
+  every 5 s). Before the first `ar.start` after the app launched, `ar.setGroup` / `ar.setFurniture`
+  reply `{error: 'ar-not-started'}`; the other group messages simply see no groups.
+- **`ar.start` with reset (the default) and `ar.stop` remove all groups (and `ar.stop` the
+  light).** Create groups after `ar.start` has resolved. `ar.clearGroups` removes "furniture"
+  too; `ar.removeGroup` of an unknown id replies `{ok}`.
 - The stage-2 messages still work and are a group with id `"furniture"` (anchored):
   `ar.setFurniture {boxes, position, yaw, shadow}`, `ar.moveFurniture {position, yaw}`,
   `ar.clearFurniture`. `ar.status.furniture` is still sent.
@@ -180,13 +200,14 @@ Updating poses every frame does not rebuild meshes.
 `ar.depth` `{rect?: [x0, y0, x1, y1] (image coordinates, default whole map), step?: 2,
 personDepth?: false}` → `{ok, t, camera, display, viewport, depthSize, rect: [u0, v0, u1, v1],
 step, w, h, depth: b64, info: b64, personDepth?: b64}` — same encodings as a hand patch
-(`personDepth` Uint16 mm). At most 49 152 pixels (the whole map).
+(`personDepth` Uint16 mm). At most 49 152 pixels: a larger request gets a bigger `step` (the reply
+carries the step used). Without a LiDAR map: `{error: 'no-depth'}`.
 
 ## 8. Light
 
 `ar.setLight` `{on, direction?: [x, y, z] (the way the light travels, default [0.3, -1, -0.2]),
 intensity?: 2000 (lux), shadow?: true, shadowDistance?: 2, color?: [r, g, b]}` → `{ok}`. A
-directional light; with `shadow`, virtual objects cast shadows on each other, and on the real
+directional light; `on` defaults to true, `on: false` removes it. With `shadow`, virtual objects cast shadows on each other, and on the real
 world when `meshReceivesLighting` is on.
 
 ## 9. Haptics (works without AR)

@@ -93,7 +93,7 @@ struct WebView: UIViewRepresentable {
 
         /// A new page (or a reload) starts without AR; the page asks for it again if it wants it.
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-            _ = model.ar.stop()
+            model.ar.pageChanged()
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -110,6 +110,9 @@ struct WebView: UIViewRepresentable {
 
         func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
             NativeLog.shared.log("web content process terminated, reloading", level: "warn")
+            // The page that owned the camera is gone: without this, AR (camera, LiDAR, Vision)
+            // would keep running under the error panel if the reload fails.
+            model.ar.pageChanged()
             webView.reload()
         }
 

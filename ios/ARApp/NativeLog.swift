@@ -20,6 +20,7 @@ final class NativeLog {
     var pendingCount: Int { queue.count }
 
     private static let maxEntries = 400
+    private static let iso = ISO8601DateFormatter()
     private let launch: String
     private let fileURL: URL
     private var queue: [[String: Any]] = []
@@ -48,7 +49,7 @@ final class NativeLog {
             "level": level,
             "message": message,
             "version": BuildInfo.commit,
-            "t": ISO8601DateFormatter().string(from: Date()),
+            "t": Self.iso.string(from: Date()),
             "seq": seq,
             "launch": launch,
         ]

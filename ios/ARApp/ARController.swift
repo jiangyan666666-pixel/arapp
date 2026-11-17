@@ -170,17 +170,29 @@ final class ARController: NSObject, ARSessionDelegate {
         frameTimes = RecentValues(span: 1)
         planesDirty = true
         lastPlanesTime = 0
+        let wasRunning = running
         view.session.run(config, options: runOptions)
         running = true
-        hands.sessionStarted()
+        if wasRunning {
+            hands.sessionRestarted()
+        } else {
+            hands.sessionStarted()
+        }
         UIApplication.shared.isIdleTimerDisabled = true
         NativeLog.shared.log("ar start: session.run returned")
         return started
     }
 
+    /// A new page committed (or the web content process died): stop AR, and hand tracking goes
+    /// back to its defaults (off). Unlike stop(), this also works before AR was ever started.
+    func pageChanged() {
+        _ = stop()
+        hands.resetForNewPage()
+    }
+
     func stop() -> [String: Any] {
         guard let view = arView else { return ["ok": true, "wasRunning": false] }
-        // A new page starts from nothing: no boxes, no light. The hands config is kept.
+        // No boxes, no light after a stop. The hands config is kept (pageChanged resets it).
         boxes.removeAll()
         removeLight()
         hands.sessionStopped()
@@ -632,6 +644,8 @@ final class ARController: NSObject, ARSessionDelegate {
                 rgb = c.clamped(lowerBound: .zero, upperBound: .one)
             }
 
+            let created = light == nil
+            let hadShadow = light?.shadow != nil
             let entity: DirectionalLight
             if let existing = light {
                 entity = existing
@@ -650,9 +664,13 @@ final class ARController: NSObject, ARSessionDelegate {
             let d = direction / length
             let up = abs(d.y) > 0.99 ? SIMD3<Float>(0, 0, -1) : SIMD3<Float>(0, 1, 0)
             entity.look(at: d, from: .zero, upVector: up, relativeTo: origin)
-            NativeLog.shared.log("light set", data: [
-                "direction": list(d), "intensity": round3(intensity), "shadow": shadow,
-            ])
+            // A page may move the light every frame (e.g. to follow the camera): log only when it
+            // appears or its shadow is switched, not each update.
+            if created || hadShadow != shadow {
+                NativeLog.shared.log("light set", data: [
+                    "direction": list(d), "intensity": round3(intensity), "shadow": shadow,
+                ])
+            }
             return ["ok": true]
         } catch {
             return ["error": errorText(error)]
