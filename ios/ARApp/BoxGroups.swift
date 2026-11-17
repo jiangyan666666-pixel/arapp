@@ -219,7 +219,7 @@ final class BoxGroups {
             if let r = number(box["roughness"]) { look.roughness = Float(min(max(r, 0), 1)) }
             specs.append(BoxSpec(size: size, position: position, rotation: identityRotation, look: look, visible: true))
         }
-        guard let position = vector(p["position"]) else { return ["error": "bad-position"] }
+        guard let position = try? optionalVector(p, "position") else { return ["error": "bad-position"] }
         guard let yaw = furnitureYaw(p) else { return ["error": "bad-yaw"] }
         if groups[Self.furnitureID] == nil && groups.count >= Self.maxGroups {
             limitHit("groups")
@@ -233,7 +233,7 @@ final class BoxGroups {
     /// ar.moveFurniture {position, yaw}: an absolute pose; re-anchors.
     func moveFurniture(_ p: [String: Any]) -> [String: Any] {
         guard let group = groups[Self.furnitureID] else { return ["error": "no-furniture"] }
-        guard let position = vector(p["position"]) else { return ["error": "bad-position"] }
+        guard let position = try? optionalVector(p, "position") else { return ["error": "bad-position"] }
         guard let yaw = furnitureYaw(p) else { return ["error": "bad-yaw"] }
         group.entity.transform = Transform(scale: .one, rotation: yawRotation(yaw), translation: position)
         if group.anchored { anchor(group) }

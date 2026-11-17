@@ -438,6 +438,20 @@ final class HandTracker {
         let input = HandFrame(frame, viewport: viewport)
         seq += 1
         let job = seq
+        if job == 1 {
+            // Once per "on": what the worker really gets on this phone with this configuration.
+            var data: [String: Any] = [
+                "image": [CVPixelBufferGetWidth(input.image), CVPixelBufferGetHeight(input.image)],
+                "imageFormat": fourCC(CVPixelBufferGetPixelFormatType(input.image)),
+                "depth": input.depth != nil, "confidence": input.confidence != nil,
+                "personMask": input.person != nil, "personDepth": input.personDepth != nil,
+                "display": list(input.display), "viewport": list(viewport),
+            ]
+            if let depth = input.depth {
+                data["depthSize"] = [CVPixelBufferGetWidth(depth), CVPixelBufferGetHeight(depth)]
+            }
+            NativeLog.shared.log("hands: first frame", data: data)
+        }
         let gen = generation
         let patches = config.patchEvery > 0 && job % config.patchEvery == 0
         inFlight = true
