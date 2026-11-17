@@ -1,5 +1,6 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 import { defineConfig } from 'vite';
 import basicSsl from '@vitejs/plugin-basic-ssl';
 
@@ -196,10 +197,128 @@ const captureReceiver = {
   },
 };
 
+// Dev only: hand recordings (src/hand/recorder.js). The phone records the raw "ar.hands" /
+// "ar.status" / "ar.planes" events for a few seconds and sends them here, so hand tracking can be
+// replayed and tuned on the PC against real data.
+//   POST /__handrec          a JSON object, at most 64 MB → notes/handrec/<YYYY-MM-DD_HH-MM-SS>[_<note>].json
+//                            reply {ok, file, name}
+//   GET  /__handrec          {ok, names: [...]} newest first
+//   GET  /__handrec/<name>   that file
+// Names are ours ([A-Za-z0-9_.-], ending .json), so a request can never reach outside the folder.
+// BLIND TEST: a recording carries hand sizes only; the terminal line carries no furniture size.
+const HANDREC_DIR = resolve(NOTES_DIR, 'handrec');
+const HANDREC_MAX = 64 * 1024 * 1024;
+const HANDREC_NAME = /^[A-Za-z0-9_-][A-Za-z0-9_.-]*\.json$/;
+const handrecReceiver = {
+  name: 'handrec-receiver',
+  configureServer(server) {
+    server.middlewares.use('/__handrec', (req, res) => {
+      const reply = (code, obj) => {
+        res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
+        res.end(JSON.stringify(obj));
+      };
+      const path = (req.url || '/').split(/[?#]/)[0];
+      if (req.method === 'GET') {
+        if (path === '/' || path === '') {
+          let names = [];
+          if (existsSync(HANDREC_DIR)) {
+            names = readdirSync(HANDREC_DIR)
+              .filter((n) => HANDREC_NAME.test(n))
+              .map((n) => ({ n, t: statSync(resolve(HANDREC_DIR, n)).mtimeMs }))
+              .sort((a, b) => b.t - a.t || (a.n < b.n ? 1 : -1))
+              .map((e) => e.n);
+          }
+          return reply(200, { ok: true, names });
+        }
+        let name;
+        try {
+          name = decodeURIComponent(path.slice(1));
+        } catch {
+          return reply(400, { ok: false, error: 'bad name' });
+        }
+        const file = resolve(HANDREC_DIR, name);
+        if (!path.startsWith('/') || !HANDREC_NAME.test(name) || name.includes('..') || dirname(file) !== HANDREC_DIR) {
+          return reply(400, { ok: false, error: 'bad name' });
+        }
+        readFile(file).then(
+          (body) => {
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': body.length, 'Cache-Control': 'no-cache' });
+            res.end(body);
+          },
+          () => reply(404, { ok: false, error: 'no such recording' }),
+        );
+        return;
+      }
+      if (req.method !== 'POST' || (path !== '/' && path !== '')) return reply(405, { ok: false, error: 'POST /__handrec or GET' });
+      const chunks = [];
+      let size = 0;
+      req.on('data', (c) => {
+        size += c.length;
+        if (size > 2 * HANDREC_MAX) req.destroy(); // not a recording; stop reading
+        else if (size <= HANDREC_MAX) chunks.push(c);
+      });
+      req.on('end', () => {
+        if (size > HANDREC_MAX) return reply(413, { ok: false, error: `more than ${HANDREC_MAX / 1024 / 1024} MB` });
+        try {
+          const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('need a JSON object');
+          const now = new Date();
+          const stamp = `${now.toLocaleDateString('sv-SE')}_${now.toLocaleTimeString('sv-SE').replace(/:/g, '-')}`;
+          const slug = String(data.note ?? '')
+            .normalize('NFKD')
+            .replace(/[^A-Za-z0-9]+/g, '-')
+            .replace(/^-+/, '')
+            .slice(0, 40)
+            .replace(/-+$/, '');
+          const base = slug ? `${stamp}_${slug}` : stamp;
+          let name = `${base}.json`;
+          for (let n = 2; existsSync(resolve(HANDREC_DIR, name)); n++) name = `${base}_${n}.json`;
+          mkdirSync(HANDREC_DIR, { recursive: true });
+          writeFileSync(resolve(HANDREC_DIR, name), JSON.stringify({ receivedAt: now.toISOString(), ip: req.socket.remoteAddress, ...data }));
+          const file = `notes/handrec/${name}`;
+          const count = (k) => (Array.isArray(data[k]) ? data[k].length : 0);
+          const secs = Number.isFinite(data.seconds) ? ` ${data.seconds.toFixed(1)} s,` : '';
+          server.config.logger.info(
+            `[handrec] saved ${file} (${(size / 1024 / 1024).toFixed(1)} MB,${secs} ${count('events')} hand events, ${count('statuses')} statuses, ${count('planes')} plane lists)`,
+            { timestamp: true },
+          );
+          reply(200, { ok: true, file, name });
+        } catch (e) {
+          reply(400, { ok: false, error: String(e.message || e) });
+        }
+      });
+    });
+  },
+};
+
+// Dev only: pages never reload by themselves. Vite's client (/@vite/client, put into every page)
+// reloads the page when a file changes and whenever its websocket to this server reconnects – which
+// on the phone is every time the app comes back from the background, because iOS closes the socket.
+// A reload wipes the scanned hand model and everything placed in the AR world, so:
+//   server.hmr: false  the server sends no updates when files change;
+//   server.ws: false   there is no websocket server at all (Vite 8.3.6 puts a no-op channel in its
+//                      place). The client would still try to connect, fail twice, print an error
+//                      and stop: it only polls the server and reloads after a socket that WAS open
+//                      closes ("vite:ws:disconnect"), and none ever opens.
+// To keep even that failed attempt and its console error out, the plugin below leaves the client's
+// script tag out of the pages (nothing in src/ uses import.meta.hot or imports CSS from JS, the
+// only other ways it gets loaded). A page now changes only when it is reloaded by hand (the
+// 刷新页面 buttons). Pages opened before this was switched on still run the old client – reload
+// them once by hand. If Vite re-bundles dependencies while a page is open, it can no longer tell
+// the page: reload by hand if a page fails to load after adding an import of a new package.
+const noAutoReload = {
+  name: 'no-auto-reload',
+  apply: 'serve',
+  transformIndexHtml: {
+    order: 'post',
+    handler: (html) => html.replace(/<script type="module" src="[^"]*\/@vite\/client"><\/script>\s*/g, ''),
+  },
+};
+
 export default defineConfig(({ mode }) => ({
   base: process.env.BASE_PATH || '/',
-  server: { host: true, port: 5173, strictPort: true },
-  plugins: [...(mode === 'ssl' ? [basicSsl()] : []), usdzMime, selftestUpload, logReceiver, captureReceiver],
+  server: { host: true, port: 5173, strictPort: true, hmr: false, ws: false },
+  plugins: [...(mode === 'ssl' ? [basicSsl()] : []), noAutoReload, usdzMime, selftestUpload, logReceiver, captureReceiver, handrecReceiver],
   // pre-bundle three and the addon together so dev doesn't load two copies of three
   optimizeDeps: { include: ['three', 'three/addons/loaders/GLTFLoader.js', 'three/addons/exporters/USDZExporter.js'] },
   build: {
@@ -208,7 +327,8 @@ export default defineConfig(({ mode }) => ({
     rolldownOptions: {
       input: {
         main: resolve(import.meta.dirname, 'index.html'), // the trial page
-        check: resolve(import.meta.dirname, 'check.html'), // on-device check for the current stage
+        check: resolve(import.meta.dirname, 'check.html'), // on-device check for the current stage (3)
+        check2: resolve(import.meta.dirname, 'check2.html'), // the stage-2 check, kept for the stage-2 app
       },
     },
   },

@@ -7,10 +7,11 @@
 //   furniture" on and off;  plus: the server-address screen opens (left over from stage 1) and
 //   "capture a frame" reaches the PC (data for stage 3).
 // Every answer is saved on the phone and sent to the PC as a log line "stage2-check".
+// (check2.html; it was check.html until stage 3 took that name. It still works with the stage-2 app.)
 //
 // This page is a check, not a trial: widths are shown here. Trials must never show them.
 
-import { callNative, hasAR, hasNative, nativeInfo, versionLabel } from './native.js';
+import { callNative, hasAR, hasFeature, hasNative, nativeInfo, versionLabel } from './native.js';
 import { forwardErrors, log } from './log.js';
 import * as AR from './ar.js';
 
@@ -218,6 +219,22 @@ $('tap').addEventListener('click', async (e) => {
 async function nudge(dx, dz, dyaw) {
   const f = rt.placed;
   if (!f) return;
+  if (hasFeature('groups')) {
+    // Stage-3 app: move from where the shelf is NOW. ARKit may have shifted it since it was placed
+    // (the anchor follows corrections of the map); working from the tapped pose, as below, made the
+    // shelf jump back to where it first stood on every press.
+    try {
+      const r = await AR.moveGroup('furniture', { dx, dz, dyaw });
+      if (r.transform?.length === 16 && rt.placed === f) {
+        f.position = AR.cameraPosition(r.transform);
+        f.yaw = AR.yawOf(r.transform);
+      }
+    } catch (e) {
+      toast(String(e.message || e));
+    }
+    return;
+  }
+  // stage-2 app: it only knows absolute poses
   f.position = AR.nudged(f.position, f.yaw, dx, dz);
   f.yaw += dyaw;
   try {
@@ -683,6 +700,8 @@ $('btn-replace').addEventListener('click', () => {
   rt.placing = !rt.placing;
   render();
 });
+// The dev server no longer reloads the page when it changes (vite.config.js): this does it by hand.
+$('btn-reload').addEventListener('click', () => location.reload());
 $('btn-fold').addEventListener('click', () => {
   $('panel').classList.toggle('folded');
   render();
