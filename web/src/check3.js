@@ -18,7 +18,7 @@
 // does nothing else.
 
 import { callNative, hasAR, hasFeature, hasNative, nativeInfo, versionLabel } from './native.js';
-import { forwardErrors, log } from './log.js';
+import { forwardErrors, log as logToPC } from './log.js';
 import * as AR from './ar.js';
 import { furnitureBoxesForNative } from './furniture-spec.js';
 import { HandSession, METHODS } from './hand/session.js';
@@ -44,7 +44,9 @@ const SHELF_BOXES = furnitureBoxesForNative('shelf', 0.8).map((b) => ({ ...b, si
 const TOUCH_TINT = [0.92, 0.32, 0.26];
 const BUZZ_EVERY_MS = 400;
 
-const DEFAULT_SETTINGS = { look: 'translucent', shell: 1, overlay: 'off', shadow: true, method: 'fused', predict: 'auto' };
+// prediction off by default (notes/03-stage3.md); step 6 asks the questions once with it off and
+// once with it on
+const DEFAULT_SETTINGS = { look: 'translucent', shell: 1, overlay: 'off', shadow: true, method: 'fused', predict: 'off' };
 
 /** h('button', {class: 'primary', onclick: fn}, 'text', child…) */
 function h(tag, props = {}, ...children) {
@@ -137,7 +139,33 @@ const rt = {
   sendLine: '',
   interruptions: 0,
   bgBusy: false,
+  bgNote: '',
+  pcOk: true, // did the last log line reach the PC
+  pcError: '',
+  errorsLogged: new Set(), // hand-pipeline errors already sent (first of each kind only)
+  capturing: false,
+  captureLine: '',
+  scanRec: null, // a rolling HandRecorder while scanning
 };
+
+/**
+ * A log line to the PC. Remembers whether it arrived (the HUD shows 「电脑收不到」 while not);
+ * when the PC is back after a failure, the whole report is sent again.
+ */
+let logSeq = 0; // log() calls started
+let logApplied = 0; // the start number of the newest result applied to rt.pcOk
+async function log(message, data, level) {
+  const n = ++logSeq;
+  const r = await logToPC(message, data, level);
+  if (n < logApplied) return r; // a newer request has already said whether the PC is there
+  logApplied = n;
+  const wasOk = rt.pcOk;
+  rt.pcOk = r.ok;
+  rt.pcError = r.ok ? '' : r.error || '';
+  if (r.ok && !wasOk && message !== 'stage3-check') report();
+  if (wasOk !== r.ok) updateHud();
+  return r;
+}
 if (st.ruler) for (const k of ['palmWidth', 'handLength', 'thickness']) if (st.ruler[k] != null) rt.drafts[`ruler:${k}`] = String(st.ruler[k]);
 
 // --- the hand: model, view, session ---
@@ -150,6 +178,13 @@ const session = new HandSession({
   view,
   trackerOptions: { method: st.settings.method, predict: st.settings.predict === 'auto' ? 'auto' : 0 },
   onFrame,
+  onError: (where, e, info) => {
+    const msg = String(e?.message || e);
+    const key = `${where}: ${msg}`.slice(0, 200);
+    if (rt.errorsLogged.has(key) || rt.errorsLogged.size > 30) return;
+    rt.errorsLogged.add(key);
+    log('stage3: hand pipeline error', { where, error: String(e?.stack || e).slice(0, 1500), info, step: step().id }, 'error');
+  },
 });
 
 function modelSummary() {
@@ -271,6 +306,7 @@ function toast(text, ms = 3000) {
 }
 
 function updateHud() {
+  updatePcPill();
   const on = rt.arOn;
   for (const id of ['hud-track', 'hud-hand', 'hud-occ']) $(id).classList.toggle('hidden', !on);
   if (!on) return;
@@ -288,6 +324,13 @@ function updateHud() {
   hand.classList.toggle('warn', !(fresh && pose && !pose.quality?.held));
   $('hud-occ').textContent = `实物挡家具：${rt.meshOcclusion ? '开' : '关'}`;
   $('hud-occ').classList.toggle('on', rt.meshOcclusion);
+}
+
+function updatePcPill() {
+  const pill = $('hud-pc');
+  if (!pill) return;
+  pill.classList.toggle('hidden', rt.pcOk);
+  pill.title = rt.pcError;
 }
 
 async function setMeshOcclusion(on) {
@@ -331,7 +374,16 @@ function context() {
     fps: s?.fps ?? null,
     meshOcclusion: rt.meshOcclusion,
     settings: { ...st.settings },
-    hands: { rate: k.rate, handShare: k.handShare, poseShare: k.poseShare, visionMs: k.visionMs, webMs: k.webMs, latency: k.latency, predictS: r3(k.predictS) },
+    hands: {
+      rate: k.rate,
+      handShare: k.handShare,
+      poseShare: k.poseShare,
+      visionMs: k.visionMs,
+      webMs: k.webMs,
+      latency: k.latency?.n > 0 ? k.latency : null,
+      lastLatency: k.lastLatency,
+      predictS: r3(k.predictS),
+    },
   };
 }
 
@@ -354,6 +406,22 @@ function report() {
     native: nativeInfo,
     ua: navigator.userAgent,
   });
+}
+
+/** The note box of each step (the id its note is saved under). */
+const NOTE_OF = { scan: 'scan', detect: 'detect', depth: 'depth', pos: 'pos', follow: 'follow', occl: 'occl', bg: 'bg', done: 'main' };
+
+/**
+ * A note typed in a step's box but not sent with an answer (typed after answering, or the step
+ * was left with 跳过 / 上一步): saved as answers[<id>Note]. Returns true if something new was saved.
+ */
+function flushNote(id) {
+  if (!id) return false;
+  const note = (rt.drafts[`note:${id}`] || '').trim();
+  if (!note || st.answers[id]?.note === note || st.answers[`${id}Note`]?.note === note) return false;
+  st.answers[`${id}Note`] = { note, at: new Date().toISOString() };
+  save();
+  return true;
 }
 
 function answer(id, value, { stay = false, extra = {} } = {}) {
@@ -419,20 +487,40 @@ async function startScan() {
   await applyView();
   render();
   log('stage3: scan started', { hand: scanHand() });
+  // a flight recorder: the last 6 s of raw events go to the PC however the scan ends (patches are
+  // ~64 KB per event, so not the whole minute)
+  let rec = null;
+  try {
+    rec = new HandRecorder({ ar: AR }).start({ note: 'scan', maxSeconds: 0, rolling: 6, model });
+  } catch {
+    rec = null;
+  }
+  rt.scanRec = rec;
   const r = await session.startScan({ timeoutS: 60 });
   rt.scanning = false;
+  rt.scanRec = null;
+  const recDone = rec ? rec.stop({ note: `scan-${r.ok ? 'ok' : r.reason}` }) : Promise.resolve(null);
   if (r.ok) {
     const saved = saveModel(r.model);
     await useModel(r.model);
     const m = r.measurements;
     st.scan = { at: new Date().toISOString(), cm: summaryCm(r.model), chirality: r.model.chirality, sources: m.sources, issues: m.issues, table: m.table, frames: m.frames, spreads: m.spreads };
     save();
-    log('stage3: hand scanned', { model: r.model, measurements: m, saved });
+    log('stage3: hand scanned', { model: r.model, measurements: m, saved, diag: r.diag });
     toast('量好了');
   } else {
-    rt.scanFail = r.reason === 'stopped' ? '' : r.reason === 'timeout' ? '一分钟还没扫好' : r.status?.hint || '没量好';
-    log('stage3: scan ended', { reason: r.reason, status: r.status ?? null });
+    rt.scanFail = r.reason === 'stopped' ? '' : r.reason === 'timeout' ? '一分钟还没扫好' : r.reason === 'error' ? '网页出错了（已发到电脑）' : r.status?.hint || '没量好';
+    const { still, ...status } = r.status || {};
+    log('stage3: scan ended', {
+      reason: r.reason,
+      status: r.status ? { ...status, still: still ?? null } : null,
+      diag: r.diag ?? null,
+      measurements: r.result?.measurements ?? null,
+      model: r.result?.model ? summaryCm(r.result.model) : null,
+      error: r.error ?? null,
+    }, r.reason === 'error' ? 'error' : 'info');
   }
+  recDone.then((x) => x && log('stage3: scan recording', { reason: r.ok ? 'ok' : r.reason, ...x }));
   await applyView();
   render();
 }
@@ -526,11 +614,11 @@ function runDetect(sub) {
 
 function detectTable() {
   return table(
-    ['', '认到手', '对上', '左 / 右', '把握'],
+    ['', '认到手', '屏幕内', '对上', '左 / 右', '把握'],
     SUBS.map((s) => {
       const r = st.detect[s.id];
-      if (!r) return [s.label, '—', '—', '—', '—'];
-      return [s.label, pct(r.handShare), pct(r.poseShare), `${r.chirality.left} / ${r.chirality.right}`, pct(r.meanConfidence)];
+      if (!r) return [s.label, '—', '—', '—', '—', '—'];
+      return [s.label, pct(r.handShare), r.screen ? pct(r.screen.handShare) : '—', pct(r.poseShare), `${r.chirality.left} / ${r.chirality.right}`, pct(r.meanConfidence)];
     }),
   );
 }
@@ -550,7 +638,8 @@ function depthLive() {
   const frame = session.frame;
   if (!P?.fused || P.fused.quality?.held || !frame?.cam) return null;
   const c = palmCentre(P.fused);
-  const plane = planeUnder(session.planes, c);
+  // the hand lies on the table: never a plane far below it (the floor)
+  const plane = planeUnder(session.planes, c, { maxBelow: 0.15 });
   const out = { distance: dist(camPosition(frame.cam), c), plane, h: {} };
   if (plane) for (const m of METHODS) if (P[m] && !P[m].quality?.held) out.h[m] = backHeight(P[m], plane);
   return out;
@@ -559,11 +648,11 @@ function depthLive() {
 function sampleDepth(frame, P) {
   if (!P.fused || P.fused.quality?.held || !frame.cam) return;
   const c = palmCentre(P.fused);
-  const plane = planeUnder(session.planes, c);
+  const plane = planeUnder(session.planes, c, { maxBelow: 0.15 });
   if (!plane) return;
   const h = {};
   for (const m of METHODS) if (P[m] && !P[m].quality?.held) h[m] = backHeight(P[m], plane);
-  rt.depthRec.samples.push({ d: dist(camPosition(frame.cam), c), h });
+  rt.depthRec.samples.push({ d: dist(camPosition(frame.cam), c), h, plane: plane.id ?? null });
 }
 
 function binOf(d) {
@@ -579,27 +668,57 @@ function toggleDepthRec() {
   const samples = rt.depthRec.samples;
   rt.depthRec = null;
   const T = model.palm.thickness;
+  const R = rulerThickness();
+  const stats = (v) => (v.length ? { mean: r1(mean(v) * 100), min: r1(Math.min(...v) * 100), max: r1(Math.max(...v) * 100), n: v.length } : null);
   const bins = BINS.map(([a, b]) => {
     const inBin = samples.filter((s) => s.d >= a && s.d < b);
     const per = {};
     for (const m of METHODS) {
-      const v = inBin.map((s) => s.h[m]).filter((x) => x != null).map((x) => x - T);
-      per[m] = v.length ? { mean: r1(mean(v) * 100), min: r1(Math.min(...v) * 100), max: r1(Math.max(...v) * 100), n: v.length } : null;
+      const hs = inBin.map((s) => s.h[m]).filter((x) => x != null);
+      per[m] = stats(hs.map((x) => x - T));
+      if (R != null) per[`${m}_ruler`] = stats(hs.map((x) => x - R));
     }
     return { from: Math.round(a * 100), to: Math.round(b * 100), n: inBin.length, ...per };
   });
-  st.depth = { at: new Date().toISOString(), thickness_cm: r1(T * 100), thicknessFrom: model.source, samples: samples.length, bins };
+  const planes = [...new Set(samples.map((s) => s.plane))];
+  st.depth = {
+    at: new Date().toISOString(),
+    thickness_cm: r1(T * 100),
+    thicknessFrom: model.source,
+    // 'mask' = measured by the scan; 'default' = the scan fell back to the usual value
+    thicknessSource: model.source === 'scan' ? (st.scan?.sources?.palmThickness ?? null) : 'default',
+    rulerThickness_cm: R != null ? r1(R * 100) : null,
+    planes,
+    samples: samples.length,
+    bins,
+  };
   save();
   log('stage3: depth bins', st.depth);
   render();
 }
 
+/** The palm thickness the ruler gave (m), or null. */
+const rulerThickness = () => (st.ruler?.thickness > 0 ? st.ruler.thickness / 100 : null);
+
 function depthTable(d) {
   const cell = (c) => (c ? h('div', {}, h('div', {}, signed1(c.mean)), h('div', { class: 'muted' }, `${signed1(c.min)}…${signed1(c.max)}`)) : '—');
-  return [
+  const out = [
     table(['离手', ...METHODS_SHOWN.map((m) => METHOD_NAME[m])], d.bins.map((b) => [`${b.from}–${b.to}`, ...METHODS_SHOWN.map((m) => cell(b[m]))])),
-    line(`手背高 − 手厚（${d.thickness_cm} cm），单位 cm：平均，下面是最小…最大。应该接近 0。`, 'muted'),
+    line(`手背高 − 模型的手厚（${d.thickness_cm} cm），单位 cm：平均，下面是最小…最大。`, 'muted'),
   ];
+  if (d.rulerThickness_cm != null) {
+    out.push(
+      table(['离手', ...METHODS_SHOWN.map((m) => METHOD_NAME[m])], d.bins.map((b) => [`${b.from}–${b.to}`, ...METHODS_SHOWN.map((m) => cell(b[`${m}_ruler`]))])),
+      line(`同样的数，减的是尺子量的手厚（${d.rulerThickness_cm} cm）。`, 'muted'),
+    );
+  }
+  const ruler = d.rulerThickness_cm != null;
+  if (d.thicknessFrom === 'scan' && d.thicknessSource === 'mask') {
+    out.push(line(`模型的手厚是扫描量的，扫描和这里用的是同一套深度，所以上面那张表接近 0 不一定说明准${ruler ? '；尺子那张表更说明问题。' : '；没用尺子量手厚，没有别的对照。'}`, 'muted'));
+  } else {
+    out.push(line(`模型的手厚是常见值（${d.thickness_cm} cm），不是量出来的${ruler ? '；看尺子那张表。' : '；也没用尺子量，上面的差只能看个大概。'}`, 'muted'));
+  }
+  return out;
 }
 
 // --- step 5: positions on a ruler ---
@@ -618,7 +737,11 @@ function mark(v) {
     any = true;
     entry[m] = [0, 1, 2].map((k) => Math.round(mean(tips.map((t) => t[k])) * 1e4) / 1e4); // 0.1 mm
     entry[`n_${m}`] = tips.length;
+    const poses = session.recent(m, 0.3);
+    const newest = poses[poses.length - 1];
+    if (session.frame && Number.isFinite(newest?.t)) entry[`age_ms_${m}`] = Math.round((session.frame.t - newest.t) * 1000);
   }
+  entry.frameT = session.frame?.t ?? null;
   if (!any) {
     toast('没认到食指尖：手要在画面里');
     return;
@@ -804,6 +927,7 @@ function setTouch(on) {
 // --- step 8: one minute in the background ---
 
 function startBg() {
+  rt.bgNote = '';
   st.bg = { loadId: LOAD_ID, at: Date.now(), hiddenAt: null, backAt: null };
   delete st.answers.bgAuto;
   delete st.answers.bg;
@@ -816,23 +940,31 @@ async function recordBg(reloaded) {
   if (!st.bg || st.answers.bgAuto || rt.bgBusy) return;
   rt.bgBusy = true;
   const backAt = st.bg.backAt || Date.now();
+  // After a reload the native layer has stopped AR and hands for the new page (by design), so
+  // there is nothing to measure about the background; null = not measured.
   let arRunning = null;
-  try {
-    arRunning = Boolean((await AR.state()).running);
-  } catch {
-    arRunning = false;
+  let handsRate = null;
+  if (!reloaded) {
+    try {
+      arRunning = Boolean((await AR.state()).running);
+    } catch {
+      arRunning = false;
+    }
+    // hand events still coming from the native layer?
+    let n = 0;
+    const off = AR.onHands(() => n++);
+    await new Promise((r) => setTimeout(r, 1500));
+    off();
+    handsRate = Math.round((n / 1.5) * 10) / 10;
   }
-  // hand events still coming from the native layer? (counted raw: after a reload nothing listens yet)
-  let n = 0;
-  const off = AR.onHands(() => n++);
-  await new Promise((r) => setTimeout(r, 1500));
-  off();
   const auto = {
     value: 'auto',
     reloaded,
+    // false: the page never saw itself hidden (the reload came before, or without, the trip to the home screen)
+    hiddenSeen: Boolean(st.bg.hiddenAt),
     awaySeconds: st.bg.hiddenAt ? Math.round((backAt - st.bg.hiddenAt) / 1000) : null,
     arRunning,
-    handsRate: Math.round((n / 1.5) * 10) / 10,
+    handsRate,
     interruptions: rt.interruptions,
     at: new Date().toISOString(),
   };
@@ -903,17 +1035,43 @@ function nextButton(label = '下一步', noteId = null) {
     {
       class: 'primary',
       onclick: () => {
-        const note = noteId ? (rt.drafts[`note:${noteId}`] || '').trim() : '';
-        if (note) {
-          st.answers[`${noteId}Note`] = { note, at: new Date().toISOString() };
-          save();
-          report();
-        }
+        if (flushNote(noteId)) report();
         go(st.step + 1);
       },
     },
     label,
   );
+}
+
+/** Step-6 answers carry the prediction setting in their id: 'still' (off) / 'stillPredict' (on). */
+const predictId = (id) => (st.settings.predict === 'auto' ? `${id}Predict` : id);
+
+/** 采一帧: one frame (image, depth, person mask, Vision's joints) to the PC. */
+function captureButton() {
+  if (!rt.arOn) return null;
+  return [
+    h('button', { disabled: rt.capturing, onclick: captureFrame }, rt.capturing ? '正在采…' : '采一帧发到电脑'),
+    rt.captureLine && line(rt.captureLine, rt.captureLine.includes('✓') ? 'okc' : 'badc'),
+  ];
+}
+
+async function captureFrame() {
+  if (rt.capturing) return;
+  rt.capturing = true;
+  rt.captureLine = '';
+  render();
+  try {
+    const r = await AR.captureToPC(
+      { hands: true, mesh: false },
+      { note: `check3-${step().id}`, appVersion: nativeInfo?.version ?? 'browser', phoneHand: st.phoneHand, model: modelSummary(), settings: { ...st.settings } },
+    );
+    rt.captureLine = r.ok ? `电脑收到了 ✓ ${r.dir ?? ''}` : `没发出去：${r.error}`;
+    log('stage3: capture', { step: step().id, ok: r.ok, dir: r.dir ?? null, error: r.error ?? null });
+  } catch (e) {
+    rt.captureLine = `没采到：${e.message || e}`;
+  }
+  rt.capturing = false;
+  render();
 }
 
 const ACC = [
@@ -972,7 +1130,8 @@ const STEPS = [
     ar: true,
     text: () => [
       p('手机拿在桌面上方 25–45 cm，镜头朝下。'),
-      p(`${HAND_NAME[scanHand()]}平放在桌上：手心朝下，手指伸直、稍微分开，整只手都在画面里。`),
+      p(`${HAND_NAME[scanHand()]}平放在桌上：手心朝下，手指伸直分开，大拇指张开、离开食指，整只手都在画面里。`),
+      p('拿手机的那只手，手肘撑在桌上，手机会稳一点。'),
       p('点「开始扫描」，然后别动，大约 3 秒。'),
     ],
     live: () => {
@@ -984,10 +1143,25 @@ const STEPS = [
       if (rt.scanning) return [handsProblem(), h('button', { onclick: () => session.stopScan() }, '停止')];
       return [
         handsProblem(),
+        !st.scan && q('手放到画面里：屏幕上的点落在你手的关节上吗？'),
+        !st.scan &&
+          row(
+            ...choices(
+              'dots',
+              [
+                ['ok', '对上'],
+                ['off', '偏了'],
+                ['flipped', '左右或上下反了'],
+                ['none', '没看到点'],
+              ],
+              { stay: true },
+            ),
+          ),
         rt.scanFail && line(`没扫好：${rt.scanFail}。再扫一次。`, 'badc'),
         st.scan && scanResult(),
         h('button', { class: st.scan ? '' : 'primary', onclick: startScan }, st.scan ? '重扫' : '开始扫描'),
-        st.scan && noteInput('scan'),
+        captureButton(),
+        noteInput('scan'),
         st.scan && q('扫出来的和尺子量的：'),
         st.scan &&
           row(
@@ -1035,7 +1209,8 @@ const STEPS = [
           ),
         ),
         detectTable(),
-        line('认到手 = 有手的帧占多少；对上 = 模型对上了手；把握 = Vision 自己说的把握。', 'muted'),
+        line('认到手 = 有手的帧占多少（相机拍到的比屏幕宽，屏幕外的手也算）；屏幕内 = 手掌中心在屏幕里的；对上 = 模型对上了手；把握 = Vision 自己说的把握。', 'muted'),
+        captureButton(),
         noteInput('detect'),
         q('手和「没有手」（拿开、腿脚）分得开吗？'),
         row(
@@ -1066,8 +1241,20 @@ const STEPS = [
       if (!L) out.push(line('还没认到手：手放在画面中间。', 'warnc'));
       else {
         out.push(line(`手机到手：${cm(L.distance)} cm`, binOf(L.distance) < 0 ? 'warnc' : ''));
-        if (!L.plane) out.push(line('还没找到桌面：让手机多看一点桌面。', 'warnc'));
-        else out.push(table(['', '手背高', '减去手厚'], METHODS_SHOWN.map((m) => [METHOD_NAME[m], cm(L.h[m]), signedCm(L.h[m] == null ? null : L.h[m] - T)])));
+        const R = rulerThickness();
+        if (!L.plane) out.push(line('还没找到手下面的桌面：让手机多看一点桌面。', 'warnc'));
+        else
+          out.push(
+            table(
+              ['', '手背高', '减模型手厚', ...(R != null ? ['减尺子手厚'] : [])],
+              METHODS_SHOWN.map((m) => [
+                METHOD_NAME[m],
+                cm(L.h[m]),
+                signedCm(L.h[m] == null ? null : L.h[m] - T),
+                ...(R != null ? [signedCm(L.h[m] == null ? null : L.h[m] - R)] : []),
+              ]),
+            ),
+          );
       }
       if (rt.depthRec) {
         const counts = BINS.map(([a, b]) => rt.depthRec.samples.filter((s) => s.d >= a && s.d < b).length);
@@ -1129,10 +1316,16 @@ const STEPS = [
       h('button', { disabled: rt.recording, onclick: record5 }, rt.recording ? '正在录…（5 秒）' : '录 5 秒（发到电脑）'),
       rt.recLine && line(rt.recLine, rt.recOk ? 'okc' : 'badc'),
       rt.recLine && !rt.recOk && rt.recorder?.last && h('button', { onclick: resend }, '再发一次'),
+      line(
+        st.settings.predict === 'auto'
+          ? '预测现在开着（按延迟）：下面三题记在「预测开」名下。'
+          : '预测现在关着：下面三题记在「预测关」名下。答完可以在上面把「预测」换成「按延迟」，再答一遍。',
+        'muted',
+      ),
       q('手停住时，模型和手对得上吗？'),
       row(
         ...choices(
-          'still',
+          predictId('still'),
           [
             ['ok', '对得上'],
             ['close', '差一点'],
@@ -1144,7 +1337,7 @@ const STEPS = [
       q('手动起来，模型落后多少？'),
       row(
         ...choices(
-          'lag',
+          predictId('lag'),
           [
             ['none', '看不出'],
             ['some', '一点'],
@@ -1156,7 +1349,7 @@ const STEPS = [
       q('模型抖不抖？'),
       row(
         ...choices(
-          'jitter',
+          predictId('jitter'),
           [
             ['none', '不抖'],
             ['some', '有点'],
@@ -1228,12 +1421,16 @@ const STEPS = [
       const a = st.answers.bgAuto;
       return [
         h('button', { class: b && !a ? '' : 'primary', onclick: startBg }, b ? '再来一次' : '开始'),
+        rt.bgNote && line(rt.bgNote, 'warnc'),
         b && !a && line(rt.bgBusy ? '回来了，正在看…' : '现在回到主屏幕，1 分钟后再回来。', 'warnc'),
         a && line(a.reloaded ? '页面重新加载了' : '页面还在 ✓', a.reloaded ? 'badc' : 'okc'),
         a && line(`离开了 ${a.awaySeconds ?? '?'} 秒${a.awaySeconds != null && a.awaySeconds < 50 ? '（不到 1 分钟，可以再来一次）' : ''}`),
-        // read at the moment of coming back; after a reload the page starts AR again itself
-        a && line(a.arRunning ? '回来时 AR 还在跑 ✓' : '回来时 AR 停了' + (a.reloaded ? '（页面已重新打开它）' : ''), a.arRunning ? 'okc' : 'badc'),
-        a && line(a.handsRate > 0 ? `回来时认手还在：每秒 ${Math.round(a.handsRate)} 次 ✓` : '回来时认手停了', a.handsRate > 0 ? 'okc' : 'badc'),
+        // read at the moment of coming back
+        a && !a.reloaded && line(a.arRunning ? '回来时 AR 还在跑 ✓' : '回来时 AR 停了', a.arRunning ? 'okc' : 'badc'),
+        a && !a.reloaded && line(a.handsRate > 0 ? `回来时认手还在：每秒 ${Math.round(a.handsRate)} 次 ✓` : '回来时认手停了', a.handsRate > 0 ? 'okc' : 'badc'),
+        a &&
+          a.reloaded &&
+          line('页面重新加载了：AR 和认手会随新页面关掉再重新打开（设计如此），所以这次量不出它们在后台有没有一直跑。', 'muted'),
         a && q('回来以后，相机画面和手的模型正常吗？'),
         a &&
           row(
@@ -1309,21 +1506,26 @@ function summary() {
       ])}；${SUBS.map((x) => `${x.short} ${pct(st.detect[x.id]?.handShare)}`).join(' · ')}`,
     ),
     p(`远近：${words('depth', ACC)}　位置：${words('pos', ACC)}${D != null ? `（0→20 量到 ${D.toFixed(1)} cm）` : ''}`),
-    p(
-      `跟手：停住 ${words('still', [
-        ['ok', '对得上'],
-        ['close', '差一点'],
-        ['off', '对不上'],
-      ])} · 落后 ${words('lag', [
-        ['none', '看不出'],
-        ['some', '一点'],
-        ['much', '很明显'],
-      ])} · 抖 ${words('jitter', [
-        ['none', '不抖'],
-        ['some', '有点'],
-        ['much', '很抖'],
-      ])} · 最好的样子 ${words('bestLook', Object.entries(LOOK_NAME))}`,
+    ...['', 'Predict'].map((sfx) =>
+      sfx && !st.answers[`still${sfx}`] && !st.answers[`lag${sfx}`] && !st.answers[`jitter${sfx}`]
+        ? null
+        : p(
+            `跟手（预测${sfx ? '开' : '关'}）：停住 ${words(`still${sfx}`, [
+              ['ok', '对得上'],
+              ['close', '差一点'],
+              ['off', '对不上'],
+            ])} · 落后 ${words(`lag${sfx}`, [
+              ['none', '看不出'],
+              ['some', '一点'],
+              ['much', '很明显'],
+            ])} · 抖 ${words(`jitter${sfx}`, [
+              ['none', '不抖'],
+              ['some', '有点'],
+              ['much', '很抖'],
+            ])}`,
+          ),
     ),
+    p(`最好的样子：${words('bestLook', Object.entries(LOOK_NAME))}`),
     p(
       `实物挡：${words('occl', [
         ['yes', '能挡住'],
@@ -1340,6 +1542,7 @@ function summary() {
 }
 
 async function send() {
+  flushNote('main');
   const r = await report();
   rt.sendLine = r.ok ? '电脑收到了 ✓' : `没发出去：${r.error}`;
   render();
@@ -1370,11 +1573,16 @@ function leave(from) {
 
 function go(index) {
   const from = step();
+  if (flushNote(NOTE_OF[from.id])) report();
   st.step = Math.min(Math.max(index, 0), STEPS.length - 1);
-  if (step() !== from) leave(from);
+  if (step() !== from) {
+    leave(from);
+    rt.captureLine = '';
+  }
   save();
   enter();
   render();
+  $('panel-body').scrollTop = 0;
 }
 
 /** Things that depend on which step is showing. */
@@ -1410,7 +1618,14 @@ function render() {
 $('btn-prev').addEventListener('click', () => go(st.step - 1));
 $('btn-skip').addEventListener('click', () => go(st.step + 1));
 // The dev server no longer reloads the page when it changes (vite.config.js): this does it by hand.
-$('btn-reload').addEventListener('click', () => location.reload());
+$('btn-reload').addEventListener('click', () => {
+  // step 8 must not count a reload the user asked for as "the page did not survive"
+  if (st.bg && !st.answers.bgAuto) {
+    st.bg.manualReload = true;
+    save();
+  }
+  location.reload();
+});
 $('btn-fold').addEventListener('click', () => {
   $('panel').classList.toggle('folded');
   render();
@@ -1437,9 +1652,13 @@ setInterval(() => {
   updateHud();
 }, 250);
 
-// Step 8 after a reload: record that it happened, and whether the native session kept running,
-// before this page starts (and so resets) AR again.
-if (step().id === 'bg' && st.bg && st.bg.loadId !== LOAD_ID && !st.answers.bgAuto && HANDS) {
+// Step 8 after a reload: record that it happened (only the reload itself is measured; see
+// recordBg). A reload the user asked for (刷新页面) is not a result: start over.
+if (st.bg && st.bg.loadId !== LOAD_ID && !st.answers.bgAuto && st.bg.manualReload) {
+  st.bg = null;
+  save();
+  if (step().id === 'bg') rt.bgNote = '页面刷新过（你点的），这次不算。点「开始」再来一次。';
+} else if (step().id === 'bg' && st.bg && st.bg.loadId !== LOAD_ID && !st.answers.bgAuto && HANDS) {
   st.bg.backAt = st.bg.backAt || Date.now();
   save();
   render();

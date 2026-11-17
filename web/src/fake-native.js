@@ -177,21 +177,46 @@ const SCENES = {
       { y: 0.75, bounds: [-0.6, 0.6, -0.65, 0.05] },
       { y: 0, bounds: [-20, 20, -30, 10] },
     ],
-    planes: [plane('fake-table', 'table', [0, 0.75, -0.3], [1.2, 0.7]), plane('fake-floor', 'floor', [0, 0, -1.2], [3, 2.5])],
+    // like ARKit's: the table's anchor is turned and not at its centre (the extent is turned back
+    // by rotationOnYAxis), so pages must not read the extent as an axis-aligned box
+    planes: [plane('fake-table', 'table', [0, 0.75, -0.3], [1.2, 0.7], { yaw: 1.2, origin: [0.25, -0.12] }), plane('fake-floor', 'floor', [0, 0, -1.2], [3, 2.5])],
   },
 };
 
-function plane(id, cls, centre, [w, l]) {
+/**
+ * A horizontal plane whose real outline is the world-axis-aligned w x l rectangle around centre.
+ * yaw turns the anchor about +Y; origin = where the anchor sits, relative to the centre (x, z).
+ */
+function plane(id, cls, centre, [w, l], { yaw = 0, origin = [0, 0] } = {}) {
+  const c = Math.cos(yaw);
+  const s = Math.sin(yaw);
+  const O = [centre[0] + origin[0], centre[1], centre[2] + origin[1]];
+  // world (x, z) -> anchor (x, z): anchor X = (c, 0, -s), Z = (s, 0, c)
+  const local = (x, z) => [round((x - O[0]) * c - (z - O[2]) * s), round((x - O[0]) * s + (z - O[2]) * c)];
+  const corners = [[-w / 2, -l / 2], [w / 2, -l / 2], [w / 2, l / 2], [-w / 2, l / 2]].map(([dx, dz]) => local(centre[0] + dx, centre[2] + dz));
+  const ctr = local(centre[0], centre[2]);
   return {
     id,
     alignment: 'horizontal',
     class: cls,
-    transform: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, ...centre, 1],
-    center: [0, 0, 0],
+    transform: [c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, ...O, 1],
+    center: [ctr[0], 0, ctr[1]],
     extent: [w, l],
-    rotationOnYAxis: 0,
-    boundary: [[-w / 2, -l / 2], [w / 2, -l / 2], [w / 2, l / 2], [-w / 2, l / 2]],
+    rotationOnYAxis: round(-yaw),
+    boundary: corners,
   };
+}
+
+/** The plane's outline in world x/z (min x, max x, min z, max z), from its boundary. */
+function planeBounds(pl) {
+  const T = pl.transform;
+  const xs = [];
+  const zs = [];
+  for (const [x, z] of pl.boundary) {
+    xs.push(T[0] * x + T[8] * z + T[12]);
+    zs.push(T[2] * x + T[10] * z + T[14]);
+  }
+  return [Math.min(...xs), Math.max(...xs), Math.min(...zs), Math.max(...zs)];
 }
 
 // --- state ---
@@ -940,10 +965,15 @@ function raycast(p) {
   const hits = [];
   if (p.allowing === 'existingPlaneGeometry' || p.allowing === 'existingPlaneInfinite') {
     for (const pl of fake.planes()) {
-      const [w, l] = pl.extent;
-      const c = [pl.transform[12], pl.transform[13], pl.transform[14]];
-      const bounds = p.allowing === 'existingPlaneInfinite' ? [-1e6, 1e6, -1e6, 1e6] : [c[0] - w / 2, c[0] + w / 2, c[2] - l / 2, c[2] + l / 2];
-      const hit = castScene(ray, [{ y: c[1], bounds }]);
+      const [w, l] = pl.extent || [0, 0];
+      const o = [pl.transform[12], pl.transform[14]];
+      const bounds =
+        p.allowing === 'existingPlaneInfinite'
+          ? [-1e6, 1e6, -1e6, 1e6]
+          : Array.isArray(pl.boundary) && pl.boundary.length >= 3
+            ? planeBounds(pl) // exact for the fake's planes; a box around a recorded, turned one
+            : [o[0] - w / 2, o[0] + w / 2, o[1] - l / 2, o[1] + l / 2];
+      const hit = castScene(ray, [{ y: pl.transform[13], bounds }]);
       if (hit) hits.push({ t: hit.t, point: hit.point, plane: pl.class });
     }
   } else {

@@ -661,6 +661,7 @@ function go(index) {
   save();
   enter();
   render();
+  $('panel-body').scrollTop = 0; // a new step opens at its top
 }
 
 /** Things that depend on which step is showing. */

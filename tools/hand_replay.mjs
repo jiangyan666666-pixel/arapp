@@ -947,7 +947,7 @@ function replay(path, args) {
     typeof meta.recordedAt === 'string' ? `recorded ${meta.recordedAt}` : null,
     meta.appVersion != null ? `app ${meta.appVersion}` : null,
     typeof meta.note === 'string' && meta.note ? `note "${meta.note}"` : null,
-    isNum(meta.seconds) ? `${fx(meta.seconds)} s` : null,
+    isNum(meta.seconds) ? `${fx(meta.seconds)} s${meta.rolling > 0 && isNum(meta.attemptSeconds) && meta.attemptSeconds > meta.rolling ? ` (the last ${fx(meta.rolling)} s of ${fx(meta.attemptSeconds)} s)` : ''}` : null,
   ].filter(Boolean);
   if (head.length) out(`  ${head.join(', ')}`);
   out(

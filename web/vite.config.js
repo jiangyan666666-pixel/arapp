@@ -277,7 +277,8 @@ const handrecReceiver = {
           writeFileSync(resolve(HANDREC_DIR, name), JSON.stringify({ receivedAt: now.toISOString(), ip: req.socket.remoteAddress, ...data }));
           const file = `notes/handrec/${name}`;
           const count = (k) => (Array.isArray(data[k]) ? data[k].length : 0);
-          const secs = Number.isFinite(data.seconds) ? ` ${data.seconds.toFixed(1)} s,` : '';
+          const rolling = data.rolling > 0 && Number.isFinite(data.attemptSeconds) && data.attemptSeconds > data.rolling ? ` (the last ${data.rolling} s of ${data.attemptSeconds.toFixed(1)} s)` : '';
+          const secs = Number.isFinite(data.seconds) ? ` ${data.seconds.toFixed(1)} s${rolling},` : '';
           server.config.logger.info(
             `[handrec] saved ${file} (${(size / 1024 / 1024).toFixed(1)} MB,${secs} ${count('events')} hand events, ${count('statuses')} statuses, ${count('planes')} plane lists)`,
             { timestamp: true },

@@ -6,7 +6,7 @@
 //
 // API
 //   new HandSession({ar, model, trackerOptions = {}, view = null, onPose = null, onFrame = null,
-//                    config = {}})
+//                    onError = null, config = {}})
 //     ar              the ar.js module (hands, onHands, onStatus, onPlanes, planes)
 //     model           a HandModel (model.js)
 //     trackerOptions  HandTracker options (tracker.js); predict: 'auto' | seconds (below)
@@ -14,6 +14,9 @@
 //     onPose(pose | null, frame)               after every event
 //     onFrame(frame, pose | null, extra)       after every event; extra = {poses, scan, webMs}
 //                                              poses = {fused, lidar, size} in compare mode, else null
+//     onError(where, error, info)              a step of the per-event pipeline threw ('parse',
+//                                              'tracker', 'compare', 'scan', 'view', 'callback',
+//                                              'progress'); the pipeline goes on (a scan ends)
 //     config          the ar.hands config start() sends (HANDS_CONFIG below fills the rest)
 //   start() -> Promise<{ok, config, available}>  listen, then ar.hands({on: true, ...config})
 //   stop() -> Promise                           ar.hands({on: false}); stop listening
@@ -24,7 +27,9 @@
 //   setCompare(on)         also run one tracker per method ('fused', 'lidar', 'size'; never
 //                          predicting), for pages that compare them -> extra.poses, recent(method)
 //   startScan({durationS, minFrames, timeoutS = 0, onProgress}) -> Promise<
-//       {ok: true, model, measurements} | {ok: false, reason: 'stopped' | 'failed' | 'timeout', status}>
+//       {ok: true, model, measurements, diag} |
+//       {ok: false, reason: 'stopped' | 'failed' | 'timeout' | 'error', status, diag, result?, error?}>
+//                          diag = HandScanner.diagnostics() (issue counts, stillness numbers)
 //                          turns on a depth patch with every event while it runs (patchEvery 1,
 //                          patchStep 1, patchMax 20000, hz 15) and feeds a HandScanner with the frames and
 //                          the latest ar.planes; ends by itself, then patchEvery 0
@@ -32,13 +37,20 @@
 //   scanning, scanStatus   the scanner's last {state, progress, hint, issues}
 //   window() -> {peek(), stop()} counts events from now on; both return WindowStats =
 //       {seconds, events, rate, handShare, poseShare, meanHands, chirality: {left, right, unknown},
-//        meanConfidence (Vision's per-hand confidence, mean over the hands seen), visionMs}
+//        meanConfidence (Vision's per-hand confidence, mean over the hands seen), visionMs,
+//        screen: {events, handShare, poseShare} | null — only events whose palm centre is on the
+//          screen (the camera image is wider than the screen; null without frame.display),
+//        reasons: {why: events} — the tracker's reason, for events with a hand but no fresh pose,
+//        reprojPx: {mean, max} | null — the fresh poses' reprojection error}
 //   recent(method = 'main', seconds = 0.3) -> [HandPose] whose frame time is within the last
-//                          `seconds` (native clock) of the newest frame; 'main' = the shown pose,
-//                          a method name = its compare tracker (compare mode only)
+//                          `seconds` (native clock) of the newest frame received (a hand lost
+//                          for longer -> []); 'main' = the shown pose, a method name = its compare
+//                          tracker (compare mode only)
+//   lastLatency            the last ar.status latency that had samples, + at (page ms) | null
 //   stats() -> {running, rate, gaps, handShare, poseShare, chirality, visionMs: {mean, max} | null,
 //       webMs: {mean, max} | null, pipeMs (native: frame captured -> event sent, mean) | null,
-//       latency (ar.status.latency: {n, mean, p50, p90, max} ms) | null, fps, thermal,
+//       latency (ar.status.latency: {n, mean, p50, p90, max} ms) | null, lastLatency (+ ageMs)
+//       | null, fps, thermal,
 //       nativeRate, predictS, method}       rates over the last second, shares over the last 2 s
 //   frame, pose, poses     the last HandFrame, the last shown pose, the last compare poses
 //   planes                 the latest ar.planes list (from events; refreshPlanes() asks for it)
@@ -51,7 +63,8 @@
 import { parseHandsEvent } from './frame.js';
 import { HandTracker } from './tracker.js';
 import { HandScanner } from './scan.js';
-import { clamp } from './geom.js';
+import { clamp, imageToView, mean } from './geom.js';
+import { PALM_JOINTS } from './joints.js';
 
 export const HANDS_CONFIG = { hz: 30, maxHands: 2, window: 2, patchEvery: 0 };
 export const METHODS = ['fused', 'lidar', 'size'];
@@ -76,6 +89,15 @@ function meanMax(list) {
   return { mean: Math.round((s / list.length) * 10) / 10, max: Math.round(m * 10) / 10 };
 }
 
+/** Is this hand's palm centre on the screen? null when the frame has no display transform. */
+function palmOnScreen(frame, hand) {
+  if (!frame.display || !hand) return null;
+  const seen = PALM_JOINTS.map((j) => hand.joints[j]).filter((j) => j && j.c >= 0.3);
+  if (!seen.length) return false;
+  const [X, Y] = imageToView(frame.display, mean(seen.map((j) => j.x)), mean(seen.map((j) => j.y)));
+  return X >= 0 && X <= 1 && Y >= 0 && Y <= 1;
+}
+
 /** Event counts over a stretch of time (window()). */
 class Tally {
   constructor() {
@@ -87,12 +109,32 @@ class Tally {
     this.chirality = { left: 0, right: 0, unknown: 0 };
     this.confSum = 0;
     this.vision = [];
+    this.screen = { events: 0, withHand: 0, withPose: 0, known: false };
+    this.reasons = {};
+    this.reproj = [];
   }
 
-  add(frame, pose) {
+  /** why = the tracker's reason when there is a hand but no fresh pose; poseHand = the tracked hand's index. */
+  add(frame, pose, why = null) {
     this.events++;
+    const fresh = Boolean(pose && !pose.quality?.held);
     if (frame.hands.length) this.withHand++;
-    if (pose && !pose.quality?.held) this.withPose++;
+    if (fresh) this.withPose++;
+    if (frame.hands.length && !fresh) {
+      const k = String(why ?? 'unknown').slice(0, 60);
+      this.reasons[k] = (this.reasons[k] || 0) + 1;
+    }
+    if (fresh && Number.isFinite(pose.quality?.reprojErrPx)) this.reproj.push(pose.quality.reprojErrPx);
+    if (frame.display) {
+      this.screen.known = true;
+      this.screen.events++;
+      const on = frame.hands.map((h) => palmOnScreen(frame, h));
+      if (on.some(Boolean)) this.screen.withHand++;
+      if (fresh) {
+        const h = frame.hands.find((x) => x.index === pose.quality?.hand) ?? null;
+        if (h ? palmOnScreen(frame, h) : on.some(Boolean)) this.screen.withPose++;
+      }
+    }
     this.hands += frame.hands.length;
     for (const h of frame.hands) {
       this.chirality[h.chirality] = (this.chirality[h.chirality] || 0) + 1;
@@ -115,17 +157,28 @@ class Tally {
       chirality: { ...this.chirality },
       meanConfidence: this.hands ? r2(this.confSum / this.hands) : null,
       visionMs: meanMax(this.vision),
+      screen: this.screen.known
+        ? {
+            events: this.screen.events,
+            handShare: this.screen.events ? r2(this.screen.withHand / this.screen.events) : 0,
+            poseShare: this.screen.events ? r2(this.screen.withPose / this.screen.events) : 0,
+          }
+        : null,
+      reasons: { ...this.reasons },
+      reprojPx: meanMax(this.reproj),
     };
   }
 }
 
 export class HandSession {
-  constructor({ ar, model, trackerOptions = {}, view = null, onPose = null, onFrame = null, config = {} }) {
+  constructor({ ar, model, trackerOptions = {}, view = null, onPose = null, onFrame = null, onError = null, config = {} }) {
     this.ar = ar;
     this.model = model;
     this.view = view;
     this.onPose = onPose;
     this.onFrame = onFrame;
+    this.onError = onError;
+    this.lastLatency = null;
     this.config = { ...HANDS_CONFIG, ...config };
     const { predict = 0, ...rest } = trackerOptions;
     this.trackerOptions = rest;
@@ -254,7 +307,19 @@ export class HandSession {
 
   _onStatus(s) {
     this.status = s;
+    const lat = s?.latency;
+    if (lat && lat.n > 0) this.lastLatency = { ...lat, at: pageNow() };
     if (this.predictMode === 'auto') this._updatePredict();
+  }
+
+  _error(where, e, info = null) {
+    console.error(`hand session: ${where} failed`, e);
+    if (!this.onError) return;
+    try {
+      this.onError(where, e, info);
+    } catch (e2) {
+      console.error(e2);
+    }
   }
 
   _updatePredict() {
@@ -299,23 +364,47 @@ export class HandSession {
     this.scanning = false;
     clearTimeout(s.timer);
     if (this.running) this.ar.hands({ patchEvery: this.config.patchEvery, hz: this.config.hz }).catch(() => {});
-    s.resolve(result);
+    let diag = null;
+    try {
+      diag = s.scanner.diagnostics();
+    } catch {
+      // diagnostics are a bonus
+    }
+    s.resolve({ ...result, diag });
   }
 
   _feedScan(frame) {
     const s = this._scan;
-    const st = s.scanner.push(frame, this.planes);
+    let st;
+    try {
+      st = s.scanner.push(frame, this.planes);
+    } catch (e) {
+      this._error('scan', e, {
+        hands: frame.hands.length,
+        patch: frame.hands.map((h) => (h.patch ? [h.patch.w, h.patch.h] : null)),
+        camKeys: Object.keys(frame.cam || {}),
+        planes: this.planes.length,
+      });
+      this._endScan({ ok: false, reason: 'error', status: this.scanStatus, error: String(e?.stack || e).slice(0, 2000) });
+      return this.scanStatus;
+    }
     this.scanStatus = st;
     try {
       s.onProgress?.(st);
     } catch (e) {
-      console.error(e);
+      this._error('progress', e);
     }
     if (st.state === 'done') {
       const r = s.scanner.result();
       this._endScan(r ? { ok: true, model: r.model, measurements: r.measurements } : { ok: false, reason: 'failed', status: st });
     } else if (st.state === 'failed') {
-      this._endScan({ ok: false, reason: 'failed', status: st, result: s.scanner.result() });
+      let result = null;
+      try {
+        result = s.scanner.result();
+      } catch (e) {
+        this._error('scan', e);
+      }
+      this._endScan({ ok: false, reason: 'failed', status: st, result });
     }
     return st;
   }
@@ -328,23 +417,25 @@ export class HandSession {
     try {
       frame = parseHandsEvent(ev);
     } catch (e) {
-      console.error('hand session: bad ar.hands event', e);
+      this._error('parse', e, { keys: ev && typeof ev === 'object' ? Object.keys(ev) : typeof ev });
       return;
     }
     let pose = null;
     try {
       pose = this.tracker.update(frame);
     } catch (e) {
-      console.error('hand session: tracker failed', e);
+      this._error('tracker', e);
     }
+    const why = frame.hands.length && !(pose && !pose.quality?.held) ? (this.tracker.lastDebug?.rejected ?? 'unknown') : null;
     let poses = null;
     if (this.compareTrackers) {
       poses = {};
       for (const m of METHODS) {
         try {
           poses[m] = this.compareTrackers[m].update(frame);
-        } catch {
+        } catch (e) {
           poses[m] = null;
+          this._error('compare', e, { method: m });
         }
       }
     }
@@ -362,16 +453,16 @@ export class HandSession {
         if (pose) this.view.show(pose, frame.t, frame);
         else this.view.hide(frame);
       } catch (e) {
-        console.error('hand session: view failed', e);
+        this._error('view', e);
       }
     }
     const webMs = pageNow() - t0;
-    this._count(frame, pose, webMs);
+    this._count(frame, pose, webMs, why);
     try {
       this.onPose?.(pose, frame);
       this.onFrame?.(frame, pose, { poses, scan, webMs });
     } catch (e) {
-      console.error(e);
+      this._error('callback', e);
     }
   }
 
@@ -382,7 +473,7 @@ export class HandSession {
     while (list.length && list[0].t < t - HISTORY_S) list.shift();
   }
 
-  _count(frame, pose, webMs) {
+  _count(frame, pose, webMs, why = null) {
     const at = pageNow();
     const seq = Number(frame.seq);
     const gap = this._lastSeq != null && Number.isFinite(seq) && seq > this._lastSeq + 1 ? seq - this._lastSeq - 1 : 0;
@@ -398,7 +489,7 @@ export class HandSession {
       gap,
     });
     while (this._recent.length && this._recent[0].at < at - 2000) this._recent.shift();
-    for (const w of this._tallies) w.add(frame, pose);
+    for (const w of this._tallies) w.add(frame, pose, why);
   }
 
   // --- numbers ---
@@ -418,8 +509,9 @@ export class HandSession {
   recent(method = 'main', seconds = 0.3) {
     const list = this._history[method] || [];
     if (!list.length) return [];
-    const tEnd = list[list.length - 1].t;
-    return list.filter((e) => e.t >= tEnd - seconds).map((e) => e.pose);
+    // from the newest frame, not the newest pose: a hand lost a second ago has no recent pose
+    const tEnd = this.frame ? this.frame.t : list[list.length - 1].t;
+    return list.filter((e) => e.t >= tEnd - seconds && e.t <= tEnd).map((e) => e.pose);
   }
 
   stats() {
@@ -442,6 +534,7 @@ export class HandSession {
       webMs: meanMax(last1.map((e) => e.web)),
       pipeMs: pipe ? pipe.mean : null,
       latency: s?.latency ?? null,
+      lastLatency: this.lastLatency ? { ...this.lastLatency, ageMs: Math.round(now - this.lastLatency.at) } : null,
       fps: s?.fps ?? null,
       thermal: s?.thermal ?? null,
       nativeRate: s?.hands?.rate ?? null,

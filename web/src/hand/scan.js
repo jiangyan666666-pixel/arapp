@@ -13,7 +13,10 @@
 //     planes = the ar.planes list (fallback for the table when LiDAR does not give one).
 //     Needs depth patches: the page turns on patchEvery: 1 while scanning (and preferably
 //     patchStep: 1 with patchMax ~ 20000, so the mask is not thinned out near the phone).
-//   status -> the last push's result
+//   status -> the last push's result (also .still = {residual, shift, limit, shiftLimit} of
+//     this frame's stillness test, when it ran)
+//   diagnostics() -> {pushes, good, counts {issue: frames}, streaks, bestProgress, still
+//     {n, min, p50, p90, max} of the residual, shift {...}, limits} over the whole attempt
 //   result() -> {model, measurements} | null (null before minFrames good frames)
 //     model.source = 'scan'; measurements = {cm (summaryCm), sources, table {height, normal,
 //     rms, source}, frames, spreads (IQR, cm), chirality {vision, geometry}, issues}
@@ -21,16 +24,23 @@
 //
 // Per frame (all must hold, else the frame is bad):
 //   exactly one hand (counting hands with >= 10 joints at c >= 0.5); >= 19 of its 21 joints at
-//   c >= 0.5 and a patch; every such joint inside the on-screen part of the image; a table plane:
+//   c >= 0.5 and a patch ('joints-missing'; when a missing joint, extrapolated along its finger,
+//   lands outside the image or the screen, the hand is cut off: also 'off-screen', whose hint comes
+//   first); every such joint inside the on-screen part of the image; a table plane:
 //   the patch's non-person pixels with LiDAR confidence >= 1, unprojected, kept within 2 cm of
 //   the most common 1-cm height, fit, drop > 1.5 cm, refit; normal within 15 deg of up, rms
 //   < 1 cm, >= 200 points (else a horizontal ar.planes plane under the hand); palm depth
 //   0.2-0.6 m; the palm (median height above the table of the person pixels inside the palm
 //   polygon) at most 5 cm high (resting on the table, not hovering); flat & open (2D angle
-//   between consecutive bones of each finger < 30 deg); still (over the last 0.3 s, the 80th
-//   percentile over the joints of their largest distance from their mean < 0.004 in image
-//   coords). durationS of continuous good frames (bad frames for more than 0.3 s restart),
-//   at least minFrames, end the scan. Frames without a patch neither count nor break it.
+//   between consecutive bones of each finger < 30 deg); still: over the last 0.3 s, each
+//   frame's joints are fitted onto the last frame's by a 2D shift, turn and scale (a hand-held
+//   phone's shake moves, turns and resizes the whole hand in the image; that is not the hand
+//   moving, and each frame is measured with its own camera pose anyway), then the 80th
+//   percentile over the joints of their largest distance from their mean < stillMax (0.004 of
+//   the image width) — 'moving'; and the whole hand's shift over those 0.3 s < shiftMax (0.03,
+//   motion blur) — 'phone-moving'. durationS of continuous good frames (bad frames for more than maxGapS
+//   = 0.5 s restart; longer than stillS, so one jolt does not throw the streak away), at least
+//   minFrames, end the scan. Frames without a patch neither count nor break it.
 //
 // Measurements (over the collected frames; medians, spread = IQR):
 //   thickness first: palm = median height of the person pixels (confidence >= 1) inside the
@@ -50,7 +60,11 @@
 //     of the palm box, which is aligned with that axis. Each edge is then moved to the height
 //     LiDAR sees just inside it (the outline is where the camera's ray grazes the hand, which is
 //     not at half the thickness: a sharp edge grazes at the top; clamped to 0.25-1.1 of the
-//     thickness, as mask edges mix in table depth). Fallback: MCP span + mean finger width.
+//     thickness, as mask edges mix in table depth). On the thumb's side the search stops halfway
+//     between indexMCP and where the thumb (MP -> tip) crosses that line, at least 1 cm past
+//     indexMCP: a thumb held against the index finger merges with the palm in the mask; then
+//     that frame gives no width rather than one that includes the thumb. Fallback: MCP span +
+//     mean finger width.
 //   finger widths: the mask's extent across the proximal segment (thumb: MP->IP) at 65% of
 //     its length (past the web between the fingers, and past the palm's edge for the little
 //     finger); each side stops at half the gap to the neighbouring finger (a touching
@@ -70,12 +84,13 @@ import { DEFAULT_SIZES, summaryCm, validModel } from './model.js';
 export const SCAN_DEFAULTS = {
   durationS: 2.5,
   minFrames: 20,
-  maxGapS: 0.3,
+  maxGapS: 0.5,
   minJointConf: 0.5,
   minGoodJoints: 19,
   depthRange: [0.2, 0.6],
   stillS: 0.3,
   stillMax: 0.004,
+  shiftMax: 0.03,
   flatDeg: 30,
   maxPalmHeight: 0.05,
 };
@@ -84,14 +99,15 @@ export const ISSUE_HINTS = {
   'no-hand': '把手摊平放在桌上',
   'two-hands': '只放一只手',
   'off-screen': '整只手要在屏幕里',
-  'joints-missing': '整只手要在屏幕里',
+  'joints-missing': '手指伸直分开，光线亮一点',
   'no-table': '没看到桌面',
   'too-close': '太近了，手机抬高一点',
   'too-far': '太远了，手机放低一点',
   'no-palm-depth': '把手摊平放在桌上',
   'not-on-table': '把手摊平放在桌上',
   'fingers-bent': '手指伸直',
-  moving: '别动，再等一下',
+  'phone-moving': '手机拿稳，手肘撑在桌上',
+  moving: '手别动，再等一下',
   'no-patch': '别动，再等一下',
 };
 const ISSUE_ORDER = Object.keys(ISSUE_HINTS);
@@ -186,20 +202,55 @@ export class HandScanner {
     this.state = 'waiting';
     this._result = null;
     this.status = { state: 'waiting', progress: 0, hint: ISSUE_HINTS['no-hand'], issues: [] };
+    this._still = null;
+    this.diag = { pushes: 0, good: 0, counts: {}, streaks: 0, bestProgress: 0, residual: [], shift: [] };
+  }
+
+  /** What happened over the whole attempt (for the log when a scan fails or times out). */
+  diagnostics() {
+    const d = this.diag;
+    const r5 = (x) => Math.round(x * 1e5) / 1e5;
+    const stats = (v) =>
+      v.length
+        ? { n: v.length, min: r5(Math.min(...v)), p50: r5(quantile(v, 0.5)), p90: r5(quantile(v, 0.9)), max: r5(Math.max(...v)) }
+        : { n: 0 };
+    return {
+      pushes: d.pushes,
+      good: d.good,
+      counts: { ...d.counts },
+      streaks: d.streaks,
+      bestProgress: Math.round(d.bestProgress * 100) / 100,
+      still: stats(d.residual),
+      shift: stats(d.shift),
+      limits: { stillMax: this.options.stillMax, shiftMax: this.options.shiftMax, maxGapS: this.options.maxGapS },
+    };
   }
 
   push(frame, planes = null) {
     if (this.state === 'done' || this.state === 'failed') return this.status;
     const o = this.options;
     const t = frame.t;
+    this._still = null;
     const { issues, data } = this._check(frame, planes);
+    const d = this.diag;
+    d.pushes++;
+    for (const k of issues) d.counts[k] = (d.counts[k] || 0) + 1;
+    if (this._still) {
+      // bounded: ~2 min at 30 Hz
+      if (d.residual.length < 4000) d.residual.push(this._still.residual);
+      if (d.shift.length < 4000) d.shift.push(this._still.shift);
+    }
     if (issues.length === 1 && issues[0] === 'no-patch') {
       // neither good nor bad: the native layer sends patches only every N-th frame
-      this.status = { ...this.status, issues };
+      this.status = { ...this.status, issues, still: this._still };
       return this.status;
     }
     if (!issues.length) {
-      if (this.streakStart === null) this.streakStart = t;
+      d.good++;
+      if (this.streakStart === null) {
+        this.streakStart = t;
+        d.streaks++;
+      }
       this.lastGoodT = t;
       this.frames.push(data);
     } else if (this.lastGoodT !== null && t - this.lastGoodT > o.maxGapS) {
@@ -209,16 +260,17 @@ export class HandScanner {
     }
     const span = this.streakStart === null ? 0 : this.lastGoodT - this.streakStart;
     const progress = Math.min(1, span / o.durationS);
+    d.bestProgress = Math.max(d.bestProgress, progress);
     if (span >= o.durationS && this.frames.length >= o.minFrames) {
       const res = this._compute();
       this._result = res;
       this.state = res && validModel(res.model) ? 'done' : 'failed';
-      this.status = { state: this.state, progress: 1, hint: this.state === 'done' ? HINT_DONE : HINT_FAILED, issues };
+      this.status = { state: this.state, progress: 1, hint: this.state === 'done' ? HINT_DONE : HINT_FAILED, issues, still: this._still };
       return this.status;
     }
     this.state = this.frames.length ? 'collecting' : 'waiting';
     const first = ISSUE_ORDER.find((k) => issues.includes(k));
-    this.status = { state: this.state, progress, hint: first ? ISSUE_HINTS[first] : HINT_COLLECTING, issues };
+    this.status = { state: this.state, progress, hint: first ? ISSUE_HINTS[first] : HINT_COLLECTING, issues, still: this._still };
     return this.status;
   }
 
@@ -241,11 +293,15 @@ export class HandScanner {
     const good = hand.joints.filter((j) => j.c >= o.minJointConf);
 
     // stillness needs the recent history, also of bad frames
-    this.recent.push({ t: frame.t, xy: hand.joints.map((j) => [j.x, j.y]), c: hand.joints.map((j) => j.c) });
+    // in units of the image width, so x and y count the same
+    this.recent.push({ t: frame.t, xy: hand.joints.map((j) => [j.x, (j.y * IH) / IW]), c: hand.joints.map((j) => j.c) });
     while (this.recent.length && this.recent[0].t < frame.t - o.stillS) this.recent.shift();
 
-    if (good.length < o.minGoodJoints) issues.push('joints-missing');
-    if (frame.display && good.some((j) => {
+    if (good.length < o.minGoodJoints) {
+      issues.push('joints-missing');
+      if (this._cutOff(hand, frame, IW, IH)) issues.push('off-screen');
+    }
+    if (!issues.includes('off-screen') && frame.display && good.some((j) => {
       const [X, Y] = imageToView(frame.display, j.x, j.y);
       return X < 0 || X > 1 || Y < 0 || Y > 1;
     })) issues.push('off-screen');
@@ -306,18 +362,14 @@ export class HandScanner {
       if (issues.includes('fingers-bent')) break;
     }
 
-    // still
+    // still (see the header): the hand's shape must hold; the whole hand may drift a little
     const span = this.recent.length ? frame.t - this.recent[0].t : 0;
     if (span < o.stillS * 0.6) issues.push('moving');
     else {
-      const ranges = [];
-      for (let j = 0; j < 21; j++) {
-        const xs = this.recent.map((r) => r.xy[j]);
-        const mx = mean(xs.map((p) => p[0]));
-        const my = mean(xs.map((p) => p[1]));
-        ranges.push(Math.max(...xs.map((p) => Math.hypot(p[0] - mx, p[1] - my))));
-      }
-      if (quantile(ranges, 0.8) > o.stillMax) issues.push('moving');
+      const still = this._stillness(o.minJointConf);
+      this._still = { residual: still.residual, shift: still.shift, limit: o.stillMax, shiftLimit: o.shiftMax };
+      if (still.shift > o.shiftMax) issues.push('phone-moving');
+      if (still.residual > o.stillMax) issues.push('moving');
     }
     if (issues.length) return { issues };
 
@@ -367,6 +419,92 @@ export class HandScanner {
         fingerH,
       },
     };
+  }
+
+  /**
+   * Are joints missing because the hand runs out of the picture? Each missing joint is
+   * extrapolated along its finger from the last two good joints before it (bone by bone, as long
+   * as the last good bone; from wrist -> root at half its length per bone when only the root is
+   * good; a missing root from the next two joints; a missing wrist from the middle finger's first
+   * bone, twice); if one lands outside the image, or outside the screen when
+   * the frame has a display transform, the hand is cut off. Joints with no two good neighbours to
+   * go by are not counted either way.
+   */
+  _cutOff(hand, frame, IW, IH) {
+    const minC = this.options.minJointConf;
+    const J2 = hand.joints;
+    const good = (k) => J2[k] && J2[k].c >= minC;
+    const outside = (x, y) => {
+      if (x < 0 || x > 1 || y < 0 || y > 1) return true;
+      if (!frame.display) return false;
+      const [X, Y] = imageToView(frame.display, x, y);
+      return X < 0 || X > 1 || Y < 0 || Y > 1;
+    };
+    const beyond = (a, b, k) => outside(J2[b].x + (J2[b].x - J2[a].x) * k, J2[b].y + (J2[b].y - J2[a].y) * k);
+    for (const f of FINGERS) {
+      const c = CHAIN[f];
+      for (let k = 0; k < 4; k++) {
+        if (good(c[k])) continue;
+        if (k === 0) {
+          if (good(c[1]) && good(c[2]) && beyond(c[2], c[1], 1)) return true;
+          continue;
+        }
+        let g = k - 1;
+        while (g >= 1 && !good(c[g])) g--;
+        if (g >= 1 && good(c[g]) && good(c[g - 1])) {
+          if (beyond(c[g - 1], c[g], k - g)) return true;
+        } else if (good(c[0]) && good(J.wrist)) {
+          // only the root is good: along wrist -> root, at about half the palm per bone
+          const x = J2[c[0]].x + (J2[c[0]].x - J2[J.wrist].x) * 0.5 * k;
+          const y = J2[c[0]].y + (J2[c[0]].y - J2[J.wrist].y) * 0.5 * k;
+          if (outside(x, y)) return true;
+        }
+      }
+    }
+    if (!good(J.wrist) && good(J.middleMCP) && good(J.middlePIP) && beyond(J.middlePIP, J.middleMCP, 2)) return true;
+    return false;
+  }
+
+  /**
+   * Over this.recent (joints good in every frame): shift = the largest distance of a frame's
+   * centroid from the mean centroid; residual = 80th percentile over the joints of their largest
+   * distance from their mean, after each frame is fitted onto the last one by a 2D similarity
+   * (shift, turn, scale; least squares).
+   */
+  _stillness(minConf) {
+    const R = this.recent;
+    let use = [];
+    for (let j = 0; j < 21; j++) if (R.every((r) => r.c[j] >= minConf)) use.push(j);
+    if (use.length < 5) use = [...Array(21).keys()];
+    const centre = R.map((r) => [mean(use.map((j) => r.xy[j][0])), mean(use.map((j) => r.xy[j][1]))]);
+    const cx = mean(centre.map((p) => p[0]));
+    const cy = mean(centre.map((p) => p[1]));
+    const shift = Math.max(...centre.map((p) => Math.hypot(p[0] - cx, p[1] - cy)));
+    const centred = R.map((r, i) => use.map((j) => [r.xy[j][0] - centre[i][0], r.xy[j][1] - centre[i][1]]));
+    const ref = centred[centred.length - 1];
+    const aligned = centred.map((P) => {
+      // p -> [a -b; b a] p minimising |that - ref|^2
+      let pp = 0;
+      let pq = 0;
+      let px = 0;
+      for (let k = 0; k < P.length; k++) {
+        pp += P[k][0] * P[k][0] + P[k][1] * P[k][1];
+        pq += P[k][0] * ref[k][0] + P[k][1] * ref[k][1];
+        px += P[k][0] * ref[k][1] - P[k][1] * ref[k][0];
+      }
+      if (!(pp > 0)) return P;
+      const a = pq / pp;
+      const b = px / pp;
+      return P.map(([x, y]) => [a * x - b * y, b * x + a * y]);
+    });
+    const ranges = [];
+    for (let k = 0; k < use.length; k++) {
+      const xs = aligned.map((P) => P[k]);
+      const mx = mean(xs.map((p) => p[0]));
+      const my = mean(xs.map((p) => p[1]));
+      ranges.push(Math.max(...xs.map((p) => Math.hypot(p[0] - mx, p[1] - my))));
+    }
+    return { residual: quantile(ranges, 0.8), shift };
   }
 
   _tablePlane(pts) {
@@ -546,8 +684,24 @@ export class HandScanner {
     for (const p of per) {
       const { fr, C, X, Y } = p;
       const M = scale(add(C[J.indexMCP], C[J.littleMCP]), 0.5);
-      const a = extent(fr, M, X, 0.1, palmT, 0.001);
-      const b = extent(fr, M, scale(X, -1), 0.1, palmT, 0.001);
+      const Zp = norm(cross(X, Y));
+      const palmCap = (sgn) => {
+        // the thumb, if it crosses the line through M on this side (see the header)
+        const xI = dot(sub(C[J.indexMCP], M), X) * sgn;
+        if (xI <= 0) return 0.1;
+        let xT = Infinity;
+        const chain = [C[J.thumbMP], C[J.thumbIP], C[J.thumbTip]];
+        for (let s = 0; s < 2; s++) {
+          for (let k = 0; k <= 10; k++) {
+            const q = add(chain[s], scale(sub(chain[s + 1], chain[s]), k / 10));
+            const d = dot(sub(q, M), X) * sgn;
+            if (d > xI && Math.abs(dot(sub(q, M), Zp)) < 0.012) xT = Math.min(xT, d);
+          }
+        }
+        return Number.isFinite(xT) ? Math.min(0.1, xI + Math.max(0.01, (xT - xI) / 2)) : 0.1;
+      };
+      const a = extent(fr, M, X, palmCap(1), palmT, 0.001);
+      const b = extent(fr, M, scale(X, -1), palmCap(-1), palmT, 0.001);
       if (a !== null && b !== null) palmWidths.push(a + b);
 
       // proximal segments as 2D lines on the table, for the gaps between fingers

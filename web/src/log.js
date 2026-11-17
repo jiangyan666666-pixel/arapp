@@ -8,9 +8,13 @@ import { nativeInfo } from './native.js';
  * @returns {Promise<{ok: boolean, error?: string}>} never rejects
  */
 export async function log(message, data, level = 'info') {
+  // a PC that is gone can leave a request hanging for over a minute; give up after 8 s
+  const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctl ? setTimeout(() => ctl.abort(), 8000) : 0;
   try {
     const res = await fetch('/__log', {
       method: 'POST',
+      signal: ctl?.signal,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         source: 'web',
@@ -25,7 +29,9 @@ export async function log(message, data, level = 'info') {
     const r = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
     return r.ok ? { ok: true } : { ok: false, error: r.error || `HTTP ${res.status}` };
   } catch (e) {
-    return { ok: false, error: String(e.message || e) };
+    return { ok: false, error: e?.name === 'AbortError' ? '电脑 8 秒没回应' : String(e.message || e) };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

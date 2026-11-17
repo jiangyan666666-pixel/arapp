@@ -45,6 +45,7 @@ import { CHAIN, FINGERS, PALM_JOINTS } from './joints.js';
 import { add, sub, scale, dot, cross, norm, len, quatRotate, quatFromBasis, project, imageToView } from './geom.js';
 import { segmentSizes } from './model.js';
 import { poseBoxes, palmBoxCentre } from './pose.js';
+import { onPlane } from './scan.js';
 
 export const LOOKS = ['translucent', 'solid', 'edges', 'occluder', 'off'];
 export const SHELLS = [1, 1.15, 1.3];
@@ -78,13 +79,11 @@ export function planeUnder(planes, p, { maxBelow = 0.8, margin = 0.1 } = {}) {
     const o = [T[12], T[13], T[14]];
     const h = dot(sub(p, o), n);
     if (h < -0.02 || h > maxBelow) continue;
-    // inside the plane's extent (plane space x, z), grown by the margin
+    // on the plane (its boundary polygon, else its turned extent; plane space x, z), grown by the margin
     const d = sub(p, o);
     const lx = dot(d, norm([T[0], T[1], T[2]]));
     const lz = dot(d, norm([T[8], T[9], T[10]]));
-    const c = pl.center || [0, 0, 0];
-    const e = pl.extent || [0, 0];
-    if (Math.abs(lx - c[0]) > e[0] / 2 + margin || Math.abs(lz - c[2]) > e[1] / 2 + margin) continue;
+    if (!onPlane(pl, lx, lz, margin)) continue;
     if (!best || h < best.h) best = { id: pl.id, class: pl.class, y: o[1], p: o, n, h };
   }
   if (!best) return null;
@@ -221,12 +220,14 @@ export class HandView {
       }
     }
     const visible = this.look !== 'off' && this._shown;
+    // setGroup is posted now, before the await: every update show() sends from here on reaches
+    // the native layer after it, so it must already carry the new number of layers
+    this._layers = looks.length;
     await this.ar.setGroup(this.groupId, boxes, { visible });
     const shadowBoxes = Array.from({ length: N }, () => ({ size: [0.01, SHADOW_THICK, 0.01], position: [0, -10, 0], color: [0, 0, 0], opacity: 0.3, material: 'unlit' }));
     await this.ar.setGroup(this.shadowId, shadowBoxes, { visible: false });
     this._shadowShown = false;
     this._created = true;
-    this._layers = looks.length;
     await this._occlusionFor(this.look);
   }
 

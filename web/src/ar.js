@@ -98,14 +98,25 @@ export const capture = (options = {}) => callNative('ar.capture', options, 30000
  * Captures a frame and sends it to the PC (vite.config.js → notes/captures/<time>/).
  * @returns {Promise<{ok: boolean, dir?: string, summary?: object, error?: string}>}
  */
-export async function captureToPC(options = {}, extra = {}) {
+export async function captureToPC(options = {}, extra = {}, { timeoutMs = 30000 } = {}) {
   const frame = await capture(options);
-  const res = await fetch('/__capture', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ...frame, ...extra, capturedAt: new Date().toISOString() }),
-  });
-  return res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+  // the upload (several MB) gets its own time limit: a PC that is gone would otherwise leave it
+  // hanging for minutes
+  const ctl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = ctl ? setTimeout(() => ctl.abort(), timeoutMs) : 0;
+  try {
+    const res = await fetch('/__capture', {
+      method: 'POST',
+      signal: ctl?.signal,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...frame, ...extra, capturedAt: new Date().toISOString() }),
+    });
+    return await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+  } catch (e) {
+    return { ok: false, error: e?.name === 'AbortError' ? `电脑 ${Math.round(timeoutMs / 1000)} 秒没回应` : String(e.message || e) };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // --- stage 3: hands, groups of boxes, planes, depth, light, haptics (docs/protocol.md §4–§9) ---

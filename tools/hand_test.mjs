@@ -22,6 +22,7 @@ import { poseFromJoints, poseBoxes, palmBoxCentre } from '../web/src/hand/pose.j
 import { OneEuro, OneEuro3 } from '../web/src/hand/filters.js';
 import { HandTracker } from '../web/src/hand/tracker.js';
 import { HandScanner, onPlane } from '../web/src/hand/scan.js';
+import { planeUnder } from '../web/src/hand/view.js';
 import { rng, makeCamera, displayFor, portraitMatrices, handJoints, restingPose, handsEvent, INTRINSICS } from '../web/src/hand/sim.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -448,22 +449,37 @@ function knownModel() {
   return m;
 }
 
-function scan(m, D, { noise = null, frames = 120, chirality, el = 65, planes = null, table = { height: TABLE }, seed = 1 } = {}) {
+/**
+ * shake = amplitude (m) of a hand-held phone's wobble: the camera moves by up to `shake` and
+ * turns by up to ~2 * shake / D rad, at 0.7-1.9 Hz (each axis its own frequency).
+ */
+function scan(m, D, { noise = null, frames = 120, chirality, el = 65, planes = null, table = { height: TABLE }, seed = 1, shake = 0, wiggle = 0 } = {}) {
   const rp = restingPose(m, { table: TABLE });
   const joints = handJoints(m, rp);
   const C = add(rp.origin, quatRotate(rp.rotation, palmBoxCentre(m, m.chirality)));
-  const cam = cameraAt([C[0], TABLE, C[2]], D, el);
+  const target = [C[0], TABLE, C[2]];
+  const cam0 = cameraAt(target, D, el);
   const sc = new HandScanner();
   const r = rng(seed);
   let st = null;
   let last = null;
   for (let i = 0; i < frames; i++) {
-    const ev = handsEvent({ cam, model: m, joints, chirality: chirality || m.chirality, t: i / 30, seq: i, table, patch: true, patchMax: 20000, random: r, ...(noise ? { noise } : {}) });
+    const t = i / 30;
+    const w = (f, ph) => shake * Math.sin(2 * Math.PI * f * t + ph);
+    const cam = shake
+      ? makeCamera({
+          position: add(cam0.position || [cam0.transform[12], cam0.transform[13], cam0.transform[14]], [w(1.3, 0), w(0.7, 1), w(1.9, 2)]),
+          lookAt: add(target, [2 * w(0.9, 3), 0, 2 * w(1.1, 4)]),
+        })
+      : cam0;
+    // wiggle: the fingers fidget sideways on the table (amplitude in rad, 3 Hz)
+    const jt = wiggle ? handJoints(m, { ...rp, spread: wiggle * Math.sin(2 * Math.PI * 3 * t) }) : joints;
+    const ev = handsEvent({ cam, model: m, joints: jt, chirality: chirality || m.chirality, t, seq: i, table, patch: true, patchMax: 20000, random: r, ...(noise ? { noise } : {}) });
     st = sc.push(parseHandsEvent(ev), planes);
     last = st;
     if (st.state === 'done' || st.state === 'failed') break;
   }
-  return { st: last, res: sc.result(), joints, cam };
+  return { st: last, res: sc.result(), joints, cam: cam0, diag: sc.diagnostics() };
 }
 
 function scanErrors(res, m) {
@@ -523,6 +539,58 @@ for (const D of [0.3, 0.4, 0.5]) {
     const square = [[-0.5, -0.1], [0.5, -0.1], [0.5, 0.1], [-0.5, 0.1]].map(([x, z]) => [-z, x]); // the same turned rectangle as a boundary
     check('plane test: a turned extent counts the point along its long side', onPlane(turned, 0, 0.4, 0) && !onPlane({ ...turned, rotationOnYAxis: 0 }, 0, 0.4, 0));
     check('plane test: the boundary polygon decides when present', onPlane({ boundary: square }, 0, 0.4, 0) && !onPlane({ boundary: square }, 0.4, 0, 0.05) && onPlane({ boundary: square }, 0.13, 0, 0.05));
+    // view.js planeUnder on an ARKit-like table: anchor turned 1.2 rad and off the table's centre
+    // (as fake-native.js builds it); real outline x -0.6..0.6, z -0.65..0.05 at y 0.75
+    const yaw = 1.2;
+    const c = Math.cos(yaw);
+    const s = Math.sin(yaw);
+    const O = [0.25, 0.75, -0.42];
+    const local = (x, z) => [(x - O[0]) * c - (z - O[2]) * s, (x - O[0]) * s + (z - O[2]) * c];
+    const corners = [[-0.6, -0.65], [0.6, -0.65], [0.6, 0.05], [-0.6, 0.05]].map(([x, z]) => local(x, z));
+    const ctr = local(0, -0.3);
+    const desk = { id: 'desk', alignment: 'horizontal', class: 'table', transform: [c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, ...O, 1], center: [ctr[0], 0, ctr[1]], extent: [1.2, 0.7], rotationOnYAxis: -yaw };
+    const floor = { id: 'floor', alignment: 'horizontal', class: 'floor', transform: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, -1.2, 1], center: [0, 0, 0], extent: [3, 2.5] };
+    const near = [-0.55, 0.78, -0.6]; // over the table's far left corner
+    const off = [0.75, 0.78, -0.3]; // beside the table, over the floor
+    check(
+      'planeUnder: a turned, off-centre table is found under a hand near its corner (boundary and extent alike)',
+      planeUnder([desk, floor], near, { maxBelow: 0.15 })?.id === 'desk' && planeUnder([{ ...desk, boundary: corners }, floor], near, { maxBelow: 0.15 })?.id === 'desk',
+    );
+    check('planeUnder: beside the table, maxBelow 0.15 -> no plane (not the floor)', planeUnder([{ ...desk, boundary: corners }, floor], off, { maxBelow: 0.15, margin: 0.05 }) === null);
+  }
+  {
+    // a hand-held phone: the whole hand wobbles in the image, its shape does not
+    const { st: s7, res: r7, diag: d7 } = scan(km, 0.35, { shake: 0.004, frames: 240, noise: { px: 1.0, depth: 0.003 }, seed: 5 });
+    note(`shaking phone (4 mm): ${s7.state}, ${d7.pushes} frames, stillness residual p50 ${d7.still.p50} / p90 ${d7.still.p90}, shift p90 ${d7.shift.p90}, issues ${JSON.stringify(d7.counts)}`);
+    check('scan: a shaking hand-held phone (4 mm) still finishes', s7.state === 'done' && validModel(r7?.model), `${s7.hint} ${s7.issues.join(' ')}`);
+    const { diag: d8 } = scan(km, 0.35, { shake: 0.03, frames: 60, seed: 5 });
+    check('scan: a phone swinging 3 cm -> phone-moving', (d8.counts['phone-moving'] || 0) > 0, JSON.stringify(d8.counts));
+    const { st: s9, diag: d9 } = scan(km, 0.35, { wiggle: 0.08, frames: 90, seed: 5 });
+    check('scan: fingers fidgeting on the table (phone still) -> moving, no result', s9.state !== 'done' && (d9.counts.moving || 0) > 30, JSON.stringify(d9.counts));
+  }
+  {
+    // joints missing because the hand runs out of the picture -> 整只手要在屏幕里; missing in the
+    // middle of the picture -> the fingers / light hint
+    const rp = restingPose(model, { table: TABLE });
+    const joints = handJoints(model, rp);
+    const along = norm(sub(joints[J.middleTip], joints[J.wrist]));
+    const across = [along[2], 0, -along[0]];
+    const C = add(rp.origin, quatRotate(rp.rotation, palmBoxCentre(model, model.chirality)));
+    const frameAt = (ax, aim, D) =>
+      parseHandsEvent(handsEvent({ cam: cameraAt(add([C[0], TABLE, C[2]], scale(ax, aim)), D, 65), model, joints, chirality: model.chirality, t: 0, seq: 0, table: { height: TABLE }, patch: true, patchMax: 20000 }));
+    // the camera aimed off the hand: past the image's long side (screen top / bottom) at either
+    // end of the hand, and past the cropped short side (screen left / right) at either side
+    const CUT = [['wrist end', along, 0.2, 0.25], ['fingertip end', along, -0.2, 0.25], ['one side', across, -0.12, 0.25], ['other side', across, 0.12, 0.25], ['other side', across, 0.16, 0.3]];
+    for (const [name, ax, aim, D] of CUT) {
+      const f = frameAt(ax, aim, D);
+      const missing = f.hands[0].joints.filter((j) => !(j.c >= 0.5)).length;
+      const st = new HandScanner().push(f);
+      check(`scan hint: hand cut off at the ${name} (${D} m; ${missing} joints missing) -> 整只手要在屏幕里`, missing > 2 && st.hint === '整只手要在屏幕里', `${st.hint} (${st.issues.join(' ')})`);
+    }
+    const f = frameAt(along, 0, 0.4);
+    for (const j of [J.indexPIP, J.indexDIP, J.middlePIP]) f.hands[0].joints[j].c = 0;
+    const st = new HandScanner().push(f);
+    check('scan hint: joints missing mid-picture -> 手指伸直分开，光线亮一点', st.hint === '手指伸直分开，光线亮一点' && !st.issues.includes('off-screen'), `${st.hint} (${st.issues.join(' ')})`);
   }
   const { st: st4 } = scan(model, 0.4, { table: null, frames: 5 });
   check('scan: no table -> hint 没看到桌面', st4.hint === '没看到桌面', st4.hint);
