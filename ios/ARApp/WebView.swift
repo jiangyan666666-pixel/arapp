@@ -18,7 +18,7 @@ import WebKit
 //        HandTracker (ar.hands) and BoxGroups (ar.setGroup … ar.groups, ar.*Furniture).
 // Before any page script runs,
 //   window.__nativeInfo = {version, buildTime, label, ios, model, features}
-// with features = ["ar", "hands", "groups", "planes", "depth", "haptic", "light"].
+// with features = ["ar", "hands", "groups", "planes", "depth", "haptic", "light", "erase"].
 struct WebView: UIViewRepresentable {
     let model: AppModel
 
@@ -55,7 +55,7 @@ struct WebView: UIViewRepresentable {
     func updateUIView(_ uiView: WKWebView, context: Context) {}
 
     /// What this app can do; pages check before using a stage-3 message (hasFeature in native.js).
-    static let features = ["ar", "hands", "groups", "planes", "depth", "haptic", "light"]
+    static let features = ["ar", "hands", "groups", "planes", "depth", "haptic", "light", "erase"]
 
     private static func infoScript() -> String {
         let info: [String: Any] = [

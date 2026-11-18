@@ -31,6 +31,12 @@ jobs:
           brew install xcodegen
           xcodegen --version
 
+      # Xcode 26 ships the Metal compiler as a separate component (HandEraser.metal needs it)
+      - name: Metal toolchain
+        run: |
+          xcodebuild -downloadComponent MetalToolchain || echo "Metal toolchain download failed (maybe already there)"
+          xcrun metal --version || true
+
       - name: Generate project
         working-directory: ios
         run: xcodegen generate

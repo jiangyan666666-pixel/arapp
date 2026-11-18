@@ -13,7 +13,8 @@ import UIKit
 //
 //   ar.start {…options}        → runs the session (asks for camera permission the first time)
 //   ar.stop                    → pauses it; removes all groups and the light; hands pause
-//   ar.setOptions {…options}   → occlusion switches, render and debug options, planes, hands
+//   ar.setOptions {…options}   → occlusion switches, render and debug options, planes, hands,
+//                                erasing the person from the picture (HandEraser.swift)
 //   ar.state
 //   ar.raycast {x, y, allowing, alignment}   x, y in 0..1 of the screen → hits in world space
 //   ar.capture {…what to include}   → one frame: LiDAR depth, camera pose, image, mesh, hands
@@ -26,7 +27,7 @@ import UIKit
 //   ar.setFurniture / ar.moveFurniture / ar.clearFurniture   stage 2: the group "furniture"
 // and it sends events: "ar.status" a few times a second (camera pose, tracking, what ARKit sees,
 // fps, heat, hand and box-update timing), "ar.hands" per processed camera frame, "ar.planes"
-// when the planes change, "ar.error", "ar.interrupted".
+// when the planes change, "ar.erase" (an erase probe's result), "ar.error", "ar.interrupted".
 //
 // There are no gestures: the web page is on top and gets every touch.
 // World space: metres, Y up (gravity), right-handed. Matrices are 16 numbers, column-major.
@@ -42,6 +43,8 @@ final class ARController: NSObject, ARSessionDelegate {
     let hands: HandTracker
     /// The boxes the page draws, the stage-2 furniture among them.
     let boxes: BoxGroups
+    /// Erases the person (the real hand) from the camera picture (the "erase" option).
+    let eraser: HandEraser
 
     private var arView: ARView?
     private var origin: AnchorEntity?
@@ -65,7 +68,7 @@ final class ARController: NSObject, ARSessionDelegate {
         "personSegmentationWithDepth", "sceneDepth", "smoothedSceneDepth", "sceneReconstruction",
         "horizontalPlanes", "verticalPlanes", "reset",
         "personOcclusion", "meshOcclusion", "disable", "debug", "statusHz", "followAnchor",
-        "meshReceivesLighting", "planeEvents", "planesHz", "hands",
+        "meshReceivesLighting", "planeEvents", "planesHz", "hands", "erase",
     ]
     private static let lightKeys: Set<String> = ["on", "direction", "intensity", "shadow", "shadowDistance", "color"]
     private static let depthKeys: Set<String> = ["rect", "step", "personDepth"]
@@ -76,8 +79,10 @@ final class ARController: NSObject, ARSessionDelegate {
         container.isUserInteractionEnabled = false
         hands = HandTracker()
         boxes = BoxGroups()
+        eraser = HandEraser()
         super.init()
         hands.emit = { [weak self] event in self?.emit?(event) }
+        eraser.emit = { [weak self] event in self?.emit?(event) }
         // The phone gets hot with LiDAR + mesh + Vision running; the PC's log shows when.
         thermalObserver = NotificationCenter.default.addObserver(
             forName: ProcessInfo.thermalStateDidChangeNotification, object: nil, queue: .main
@@ -91,7 +96,7 @@ final class ARController: NSObject, ARSessionDelegate {
     func start(_ options: [String: Any]) async -> [String: Any] {
         NativeLog.shared.log("ar start: requested")
         logUnknownKeys(options, known: Self.optionKeys, in: "ar.start")
-        if let problem = checkHandsOption(options) { return ["error": problem] }
+        if let problem = checkHandsOption(options) ?? checkEraseOption(options) { return ["error": problem] }
         guard ARWorldTrackingConfiguration.isSupported else {
             return ["error": "ar-unsupported"]
         }
@@ -145,7 +150,7 @@ final class ARController: NSObject, ARSessionDelegate {
 
         let view = ensureView()
         view.isHidden = false
-        _ = apply(options) // cannot fail: the only failing option (hands) was checked above
+        _ = apply(options) // cannot fail: the only failing options (hands, erase) were checked above
 
         var runOptions: ARSession.RunOptions = []
         if flag(options, "reset", true) {
@@ -188,6 +193,7 @@ final class ARController: NSObject, ARSessionDelegate {
     func pageChanged() {
         _ = stop()
         hands.resetForNewPage()
+        eraser.reset(arView)
     }
 
     func stop() -> [String: Any] {
@@ -226,6 +232,7 @@ final class ARController: NSObject, ARSessionDelegate {
         result["planeEvents"] = planeEvents
         result["planesHz"] = round3(1 / planesInterval)
         result["followAnchor"] = boxes.followAnchor
+        result["erase"] = eraser.json
         return result
     }
 
@@ -244,6 +251,13 @@ final class ARController: NSObject, ARSessionDelegate {
         return view
     }
 
+    /// nil, or why the "erase" option is not valid.
+    private func checkEraseOption(_ options: [String: Any]) -> String? {
+        guard let e = given(options, "erase") else { return nil }
+        guard let config = e as? [String: Any] else { return "erase: an object {on, mask, …}" }
+        return eraser.check(config)
+    }
+
     /// nil, or why the "hands" option is not a valid ar.hands config.
     private func checkHandsOption(_ options: [String: Any]) -> String? {
         guard let h = given(options, "hands") else { return nil }
@@ -252,10 +266,10 @@ final class ARController: NSObject, ARSessionDelegate {
     }
 
     /// The options that can change while the session runs. Keys that are absent stay as they are.
-    /// Returns why it refused (only a bad "hands" config; then nothing is changed).
+    /// Returns why it refused (only a bad "hands" or "erase" config; then nothing is changed).
     private func apply(_ options: [String: Any]) -> String? {
         guard let view = arView else { return nil }
-        if let problem = checkHandsOption(options) { return problem }
+        if let problem = checkHandsOption(options) ?? checkEraseOption(options) { return problem }
         // Real objects (the LiDAR mesh) hide the virtual boxes behind them.
         if let on = options["meshOcclusion"] as? Bool {
             if on {
@@ -322,6 +336,9 @@ final class ARController: NSObject, ARSessionDelegate {
         }
         if let config = given(options, "hands") as? [String: Any] {
             _ = hands.configure(config) // checked above
+        }
+        if let config = given(options, "erase") as? [String: Any] {
+            _ = eraser.configure(config, view: view) // checked above
         }
         return nil
     }
