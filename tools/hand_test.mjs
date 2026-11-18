@@ -22,7 +22,8 @@ import { poseFromJoints, poseBoxes, palmBoxCentre } from '../web/src/hand/pose.j
 import { OneEuro, OneEuro3 } from '../web/src/hand/filters.js';
 import { HandTracker } from '../web/src/hand/tracker.js';
 import { HandScanner, onPlane } from '../web/src/hand/scan.js';
-import { planeUnder } from '../web/src/hand/view.js';
+import { planeUnder, HandView, LOOKS } from '../web/src/hand/view.js';
+import { COLORS, ROUGHNESS } from '../web/src/furniture-spec.js';
 import { rng, makeCamera, displayFor, portraitMatrices, handJoints, restingPose, handsEvent, INTRINSICS } from '../web/src/hand/sim.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -598,6 +599,50 @@ for (const D of [0.3, 0.4, 0.5]) {
   check('scan: too close -> hint to lift the phone', st5.issues.includes('too-close') || st5.issues.includes('off-screen'), `${st5.hint} (${st5.issues.join(' ')})`);
   const { st: st6 } = scan(model, 0.75, { frames: 5, el: 75 });
   check('scan: too far -> hint to lower the phone', st6.issues.includes('too-far'), st6.hint);
+}
+
+// ---------------------------------------------------------------------------------------------
+// view.js: the wooden 'model' look, and person occlusion / erase sent to the native layer
+{
+  const calls = [];
+  const ar = {
+    setOptions: async (o) => calls.push(['setOptions', JSON.parse(JSON.stringify(o))]),
+    setGroup: async (id, boxes, opts) => calls.push(['setGroup', id, boxes, opts]),
+    updateGroups: (g) => calls.push(['updateGroups', g]),
+    removeGroup: async (id) => calls.push(['removeGroup', id]),
+  };
+  const opts = () => calls.filter((c) => c[0] === 'setOptions').map((c) => c[1]);
+  const v = new HandView({ ar, personOcclusion: true });
+  await v.init(defaultModel('right'));
+  calls.length = 0;
+  await v.set({ look: 'model', shell: 1.15 });
+  const g = calls.find((c) => c[0] === 'setGroup' && c[1] === 'hand');
+  const wood = [((COLORS.wood >> 16) & 255) / 255, ((COLORS.wood >> 8) & 255) / 255, (COLORS.wood & 255) / 255];
+  const b = g?.[2] || [];
+  check(
+    "view: look 'model' = 16 opaque pbr boxes in the furniture's wood, its roughness, the palm darker",
+    LOOKS.includes('model') && b.length === 16 && b.slice(1).every((x) => x.material === 'pbr' && x.opacity === 1 && x.roughness === ROUGHNESS.wood && x.color.every((c, i) => Math.abs(c - wood[i]) < 1e-9)) && Math.abs(b[0].color[0] - wood[0] * 0.85) < 1e-9,
+  );
+  check("view: look 'model' switches person occlusion off, and no erase key is sent while erasing was never on", opts().length === 1 && opts()[0].personOcclusion === false && !('erase' in opts()[0]), JSON.stringify(opts()));
+  calls.length = 0;
+  await v.set({ look: 'edges' });
+  check('view: back to edges -> person occlusion on again', opts().length === 1 && opts()[0].personOcclusion === true, JSON.stringify(opts()));
+  calls.length = 0;
+  await v.set({ erase: { on: true, dilate: 5, probe: true } });
+  check('view: erase on -> one setOptions with the erase config (no probe) and person occlusion off', opts().length === 1 && opts()[0].personOcclusion === false && opts()[0].erase?.on === true && opts()[0].erase.dilate === 5 && !('probe' in opts()[0].erase), JSON.stringify(opts()));
+  calls.length = 0;
+  await v.set({ erase: { on: true, dilate: 5 } });
+  check('view: the same erase config again -> nothing sent', opts().length === 0, JSON.stringify(opts()));
+  await v.init(defaultModel('right'));
+  check('view: init (a new AR session) sends the erase config again', opts().some((o) => o.erase?.on === true && o.erase.dilate === 5), JSON.stringify(opts()));
+  calls.length = 0;
+  await v.set({ erase: false });
+  check('view: erase false -> erase {on: false} sent (settings kept), person occlusion back on', opts().length === 1 && opts()[0].erase?.on === false && opts()[0].erase.dilate === 5 && opts()[0].personOcclusion === true, JSON.stringify(opts()));
+  calls.length = 0;
+  await v.set({ look: 'model', erase: true });
+  await v.dispose();
+  const last = opts().at(-1);
+  check('view: dispose -> erasing off and person occlusion restored', last?.erase?.on === false && last.personOcclusion === true, JSON.stringify(opts()));
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -9,7 +9,12 @@
 //   6 跟得上吗        the model with every look / switch; latency, Vision time, rate, heat; 5-s recording
 //   7 实物挡家具      a 25 cm shelf on the table: does the hand hide it; touch -> vibrate + tint
 //   8 后台 1 分钟      does the page survive the app being in the background
-//   9 结果            every answer; "did the hand enter the picture?"; then a free mode
+//   9 手换成模型      Jiang: "the furniture is a model, the hand is video – jarring". Three ways side by
+//                    side next to the small shelf: A the look from step 6; B layer 1 = the hand as a
+//                    wooden model like the furniture (look 'model', shell 1.15) over the real hand;
+//                    C layer 2 = the same, with the real hand erased from the camera picture (native
+//                    'erase', app feature 'erase'), tunable, with debug views and a probe to the PC
+//  10 结果            every answer; "did the hand enter the picture?"; then a free mode
 // The tool shows its own facts; there is no pass / fail verdict on screen – the user decides.
 // Every answer is saved on the phone (localStorage 'arapp/stage3-check/v1', so a reload resumes)
 // and sent to the PC as the log line "stage3-check". The scanned hand model is saved (hand/model.js)
@@ -36,17 +41,34 @@ const KEY = 'arapp/stage3-check/v1';
 /** Different on every load of the page: step 8 tells "the page stayed" from "the page was reloaded". */
 const LOAD_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const HANDS = hasFeature('hands') && hasFeature('groups');
+/** Layer 2 (the real hand erased from the picture) needs the app that has it. */
+const ERASE = hasFeature('erase');
 
 const SHELF_ID = 'small-shelf';
 const SHELF_K = 0.3125; // the stage-2 shelf (80 cm wide) scaled down uniformly: 25 cm wide
 const SHELF_SIZE = [0.8 * SHELF_K, 1.8 * SHELF_K, 0.3 * SHELF_K];
 const SHELF_BOXES = furnitureBoxesForNative('shelf', 0.8).map((b) => ({ ...b, size: b.size.map((v) => v * SHELF_K), position: b.position.map((v) => v * SHELF_K) }));
 const TOUCH_TINT = [0.92, 0.32, 0.26];
+/** The steps that put the small shelf on the table (a tap places it). */
+const SHELF_STEPS = ['occl', 'model'];
 const BUZZ_EVERY_MS = 400;
 
 // prediction off by default (notes/03-stage3.md); step 6 asks the questions once with it off and
 // once with it on
-const DEFAULT_SETTINGS = { look: 'translucent', shell: 1, overlay: 'off', shadow: true, method: 'fused', predict: 'off' };
+// step 9: compare 'a' (the step-6 look) / 'b' (layer 1) / 'c' (layer 2); the wooden hand's shell;
+// the erase settings (HandEraser.swift)
+const ERASE_DEFAULTS = { mask: 'alpha', dilate: 3, feather: 2, view: 'normal' };
+const DEFAULT_SETTINGS = {
+  look: 'translucent',
+  shell: 1,
+  overlay: 'off',
+  shadow: true,
+  method: 'fused',
+  predict: 'off',
+  compare: 'b',
+  modelShell: 1.15,
+  erase: ERASE_DEFAULTS,
+};
 
 /** h('button', {class: 'primary', onclick: fn}, 'text', child…) */
 function h(tag, props = {}, ...children) {
@@ -84,7 +106,8 @@ const r3 = (v) => (v == null || !Number.isFinite(v) ? null : Math.round(v * 1000
 const HAND_NAME = { left: '左手', right: '右手' };
 const METHOD_NAME = { lidar: 'LiDAR', size: '大小', fused: '合起来' };
 const METHODS_SHOWN = ['lidar', 'size', 'fused'];
-const LOOK_NAME = { translucent: '半透明', solid: '实心', edges: '线框', occluder: '当遮挡', off: '不显示' };
+const LOOK_NAME = { translucent: '半透明', solid: '实心', edges: '线框', occluder: '当遮挡', model: '木头模型', off: '不显示' };
+const COMPARE_NAME = { a: 'A 原来的', b: 'B 一层', c: 'C 二层' };
 const THERMAL = { nominal: '正常', fair: '有点热', serious: '热', critical: '很热' };
 
 // --- state: what survives a reload (st) and what does not (rt) ---
@@ -93,7 +116,11 @@ function loadState() {
   const fresh = { step: 0, answers: {}, startedAt: new Date().toISOString(), phoneHand: null, ruler: null, scan: null, detect: {}, depth: null, marks: {}, bg: null, recordings: [], settings: { ...DEFAULT_SETTINGS } };
   try {
     const s = JSON.parse(localStorage.getItem(KEY));
-    if (s && typeof s === 'object' && s.answers) return { ...fresh, ...s, settings: { ...DEFAULT_SETTINGS, ...(s.settings || {}) } };
+    if (s && typeof s === 'object' && s.answers) {
+      const settings = { ...DEFAULT_SETTINGS, ...(s.settings || {}) };
+      settings.erase = { ...ERASE_DEFAULTS, ...(s.settings?.erase || {}) };
+      return { ...fresh, ...s, settings };
+    }
   } catch {
     /* nothing saved, or storage blocked */
   }
@@ -146,6 +173,8 @@ const rt = {
   capturing: false,
   captureLine: '',
   scanRec: null, // a rolling HandRecorder while scanning
+  eraseProbe: null, // the last 'ar.erase' probe (step 9)
+  eraseState: null, // the native erase state, polled while C shows
 };
 
 /**
@@ -201,9 +230,20 @@ async function useModel(m) {
 function wantedView() {
   const s = step();
   const set = st.settings;
-  if (s.id === 'scan' && (rt.scanning || !st.scan)) return { look: 'off', overlay: 'joints', shadow: false, shell: set.shell };
-  if (s.id === 'occl') return { look: 'off', overlay: 'off', shadow: false, shell: 1 };
-  return { look: set.look, shell: set.shell, overlay: set.overlay, shadow: set.shadow };
+  if (s.id === 'scan' && (rt.scanning || !st.scan)) return { look: 'off', overlay: 'joints', shadow: false, shell: set.shell, erase: false };
+  if (s.id === 'occl') return { look: 'off', overlay: 'off', shadow: false, shell: 1, erase: false };
+  if (s.id === 'model') {
+    if (set.compare === 'a') return { look: oldLook(), shell: set.shell, overlay: 'off', shadow: set.shadow, erase: false };
+    const erase = set.compare === 'c' && ERASE ? { on: true, ...set.erase } : false;
+    return { look: 'model', shell: set.modelShell, overlay: 'off', shadow: set.shadow, erase };
+  }
+  return { look: set.look, shell: set.shell, overlay: set.overlay, shadow: set.shadow, erase: false };
+}
+
+/** Step 9's A: the look Jiang found best in step 6 (if it is one of the old ones), else the edges. */
+function oldLook() {
+  const best = st.answers.bestLook?.value;
+  return best && !['model', 'off'].includes(best) && LOOKS.includes(best) ? best : 'edges';
 }
 
 async function applyView() {
@@ -277,7 +317,7 @@ async function ensureAR() {
     }
   }
   rt.starting = false;
-  if (step().id === 'occl' && !rt.shelf) rt.placing = true;
+  if (SHELF_STEPS.includes(step().id) && !rt.shelf) rt.placing = true;
   render();
   return rt.arOn;
 }
@@ -374,6 +414,7 @@ function context() {
     fps: s?.fps ?? null,
     meshOcclusion: rt.meshOcclusion,
     settings: { ...st.settings },
+    ...(step().id === 'model' ? { erase: rt.eraseState } : {}),
     hands: {
       rate: k.rate,
       handShare: k.handShare,
@@ -401,6 +442,7 @@ function report() {
     recordings: st.recordings,
     bg: st.bg,
     settings: st.settings,
+    eraseProbe: rt.eraseProbe,
     startedAt: st.startedAt,
     start: rt.startInfo,
     native: nativeInfo,
@@ -409,7 +451,7 @@ function report() {
 }
 
 /** The note box of each step (the id its note is saved under). */
-const NOTE_OF = { scan: 'scan', detect: 'detect', depth: 'depth', pos: 'pos', follow: 'follow', occl: 'occl', bg: 'bg', done: 'main' };
+const NOTE_OF = { scan: 'scan', detect: 'detect', depth: 'depth', pos: 'pos', follow: 'follow', occl: 'occl', bg: 'bg', model: 'model', done: 'main' };
 
 /**
  * A note typed in a step's box but not sent with an answer (typed after answering, or the step
@@ -818,7 +860,7 @@ async function resend() {
 // --- step 7: the small shelf, occlusion and touch ---
 
 $('tap').addEventListener('click', async (e) => {
-  if (!rt.arOn || !rt.placing || rt.busy || step().id !== 'occl') return;
+  if (!rt.arOn || !rt.placing || rt.busy || !SHELF_STEPS.includes(step().id)) return;
   rt.busy = true;
   try {
     const hit = await AR.raycastFloor(e.clientX / window.innerWidth, e.clientY / window.innerHeight);
@@ -1041,6 +1083,99 @@ function nextButton(label = '下一步', noteId = null) {
     },
     label,
   );
+}
+
+// --- step 9: the hand as a model ---
+
+async function setCompare(v) {
+  if (v === 'c' && !ERASE) {
+    toast('C 要装新的 app（有「抹掉真手」的版本）');
+    return;
+  }
+  await setSetting({ compare: v });
+  if (v === 'c') pollErase();
+}
+
+async function setErase(o) {
+  const was = st.settings.erase.mask;
+  st.settings.erase = { ...st.settings.erase, ...o };
+  // the depth way tells virtual from camera by depth, and the real-object mesh writes depth everywhere
+  if (o.mask === 'depth' && was !== 'depth' && rt.meshOcclusion) {
+    toast('「深度」要关掉「实物挡家具」，已经关了');
+    await setMeshOcclusion(false);
+  } else if (o.mask === 'alpha' && was === 'depth' && !rt.meshOcclusion) {
+    await setMeshOcclusion(true);
+  }
+  await setSetting({});
+  pollErase();
+}
+
+/** The native erase state now (frames drawn, failures), shown under step 9 while C is on. */
+let erasePoll = 0;
+async function pollErase() {
+  clearTimeout(erasePoll);
+  if (step().id !== 'model' || st.settings.compare !== 'c') return;
+  if (!rt.arOn) {
+    erasePoll = setTimeout(pollErase, 2000); // the camera is still coming up
+    return;
+  }
+  try {
+    rt.eraseState = (await AR.state()).erase || null;
+  } catch {
+    rt.eraseState = null;
+  }
+  updateLive();
+  erasePoll = setTimeout(pollErase, 2000);
+}
+
+async function probeErase() {
+  rt.eraseProbe = { waiting: true };
+  render();
+  try {
+    await AR.setOptions({ erase: { probe: true } });
+  } catch (e) {
+    rt.eraseProbe = { error: String(e.message || e) };
+    render();
+  }
+  setTimeout(() => {
+    if (rt.eraseProbe?.waiting) {
+      rt.eraseProbe = { error: '3 秒没有结果（C 开着吗？）' };
+      render();
+    }
+  }, 3000);
+}
+
+AR.onErase((e) => {
+  if (!e.probe) return;
+  rt.eraseProbe = e.probe;
+  log('stage3: erase probe', e.probe);
+  render();
+});
+
+/** The probe in a few words: is the background clear (alpha way), what the textures are. */
+function probeLines() {
+  const pr = rt.eraseProbe;
+  if (!pr) return [];
+  if (pr.waiting) return [line('正在测…')];
+  if (pr.error) return [line(`测不了：${pr.error}`, 'badc')];
+  const out = [];
+  const virt = (pr.alpha?.mid ?? 0) + (pr.alpha?.high ?? 0);
+  const src = pr.background?.source;
+  const clear = Array.isArray(src) && src.length === 3 && Math.max(...src) < 0.02;
+  if (pr.config?.mask === 'alpha') {
+    out.push(line(`透明度法：画面里 ${pct(virt)} 是虚拟的；背景${clear ? '是透明的 ✓' : `不透明 ✗（${pct(pr.alpha?.low)} 透明）——换「深度」试试`}`, clear ? 'okc' : 'badc'));
+  } else if (pr.depth) {
+    out.push(line(`深度法：${pct(pr.depth.other)} 有深度（= 虚拟的，加上没关的遮挡网格）`));
+  }
+  out.push(line(`纹理：${pr.source?.format} → ${pr.target?.format}${pr.mainThread ? '' : '（渲染线程）'}；电脑收到了详细数字`, 'muted'));
+  return out;
+}
+
+function eraseLive() {
+  const e = rt.eraseState;
+  if (!e) return [];
+  const bad = e.failures > 0;
+  return [line(`抹掉：画了 ${e.frames ?? 0} 帧${bad ? `，失败 ${e.failures} 次（${e.lastFailure || '?'}）` : ''}`, bad ? 'badc' : 'muted')];
 }
 
 /** Step-6 answers carry the prediction setting in their id: 'still' (off) / 'stillPredict' (on). */
@@ -1447,6 +1582,80 @@ const STEPS = [
     },
   },
   {
+    id: 'model',
+    title: '手换成模型',
+    ar: true,
+    text: () => [
+      p('手换成和家具一样的模型，三种对比着看：'),
+      p(`A 原来的（${LOOK_NAME[oldLook()]}）· B 一层：木头手盖在真手上，真手还在画面里 · C 二层：木头手，再把真手从画面里抹掉。`),
+      p('先在桌面上点一下放小书架，手放到书架旁边、前面，A / B / C 换着看。'),
+      p('截图（作品集用）：A、B、C 各截一张，手在书架旁边；C 再录 10 秒屏幕，手动一动。截图 = 侧边键 + 音量上；录屏在控制中心。'),
+    ],
+    live: () => (st.settings.compare === 'c' ? eraseLive() : []),
+    controls: () => {
+      const set = st.settings;
+      const er = set.erase;
+      const c = set.compare === 'c';
+      return [
+        handsProblem(),
+        !rt.shelf && line(rt.placing ? '在画面上点一下桌面。' : '书架还没放。', 'badc'),
+        h('button', { onclick: () => ((rt.placing = true), toast('点一下桌面'), render()) }, rt.placing ? '点一下桌面…' : rt.shelf ? '重新放书架' : '放书架'),
+        seg('看哪种', Object.entries(COMPARE_NAME).map(([v, t]) => [v, v === 'c' && !ERASE ? 'C（要新 app）' : t]), set.compare, setCompare),
+        set.compare !== 'a' && seg('木头手的壳（放大）', SHELLS.map((x) => [x, x === 1 ? '1.0' : String(x)]), set.modelShell, (v) => setSetting({ modelShell: v })),
+        !ERASE && line('C（抹掉真手）要装新的 app。现在只能看 A 和 B。', 'warnc'),
+        c && seg('抹掉的范围', [[2, '小'], [3, '中'], [5, '大'], [8, '很大']], er.dilate, (v) => setErase({ dilate: v })),
+        c && seg('边缘', [[1, '硬'], [2, '中'], [4, '软']], er.feather, (v) => setErase({ feather: v })),
+        c && seg('调试画面', [['normal', '正常'], ['mask', '抹掉哪里'], ['coverage', '哪里是虚拟'], ['split', '左右对比']], er.view, (v) => setErase({ view: v })),
+        c && er.view === 'split' && line('左边是这个 app 自己画的相机，右边是 RealityKit 原来的画面。「透明度」时右边是黑底，正常；「深度」时两边颜色应该一样。', 'muted'),
+        c && seg('分开虚拟和相机的办法', [['alpha', '透明度'], ['depth', '深度']], er.mask, (v) => setErase({ mask: v })),
+        c && h('button', { onclick: probeErase }, '测一下（发到电脑）'),
+        c && probeLines(),
+        q('B 一层（木头手，真手还在）看着怎么样？'),
+        row(
+          ...choices(
+            'modelB',
+            [
+              ['good', '好'],
+              ['ok', '还行'],
+              ['bad', '不好'],
+            ],
+            { stay: true },
+          ),
+        ),
+        ERASE && q('C 二层（真手抹掉）看着怎么样？'),
+        ERASE &&
+          row(
+            ...choices(
+              'modelC',
+              [
+                ['good', '好'],
+                ['ok', '还行'],
+                ['bad', '不好'],
+              ],
+              { stay: true },
+            ),
+          ),
+        ERASE && q('C 抹掉的地方（手指缝、手的边上）看得出来吗？'),
+        ERASE &&
+          row(
+            ...choices(
+              'eraseSeen',
+              [
+                ['no', '看不出'],
+                ['some', '有点'],
+                ['much', '很明显'],
+              ],
+              { stay: true },
+            ),
+          ),
+        q('最后用哪个？'),
+        row(...choices('modelPick', Object.entries(COMPARE_NAME).filter(([v]) => v !== 'c' || ERASE), { stay: true })),
+        noteInput('model'),
+        nextButton('下一步', 'model'),
+      ];
+    },
+  },
+  {
     id: 'done',
     title: '结果',
     ar: true,
@@ -1538,8 +1747,20 @@ function summary() {
       ])}`,
     ),
     p(`后台：${bg ? (bg.reloaded ? '页面重新加载了' : '页面还在') : '没做'}${st.answers.bg ? `（${st.answers.bg.value === 'ok' ? '正常' : '不正常'}）` : ''}　录了 ${st.recordings.length} 段`),
+    p(
+      `手换成模型：B ${words('modelB', GOOD)} · C ${words('modelC', GOOD)} · 抹掉的地方 ${words('eraseSeen', [
+        ['no', '看不出'],
+        ['some', '有点'],
+        ['much', '很明显'],
+      ])} · 用 ${words('modelPick', Object.entries(COMPARE_NAME))}`,
+    ),
   ];
 }
+const GOOD = [
+  ['good', '好'],
+  ['ok', '还行'],
+  ['bad', '不好'],
+];
 
 async function send() {
   flushNote('main');
@@ -1569,6 +1790,7 @@ function leave(from) {
     if (rt.touchOn) setTouch(false);
     rt.placing = false;
   }
+  if (from.id === 'model') rt.placing = false;
 }
 
 function go(index) {
@@ -1589,9 +1811,10 @@ function go(index) {
 function enter() {
   const s = step();
   $('panel').classList.remove('folded');
-  if (s.id === 'occl' && !rt.shelf) rt.placing = true;
+  if (SHELF_STEPS.includes(s.id) && !rt.shelf) rt.placing = true;
   if (s.ar && !rt.arOn && HANDS) ensureAR();
   else applyView();
+  if (s.id === 'model') pollErase();
 }
 
 function updateLive() {

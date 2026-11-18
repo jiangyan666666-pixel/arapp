@@ -13,7 +13,7 @@ struct EraseParams {
     float4 viewToImage0; // image x = dot(.xyz, (u, v, 1)) for the view point (u, v)
     float4 viewToImage1; // image y
     float4 mask;         // dilate (mask px), feather (mask px), maxDepth (m, 0 = none), strength 0..1
-    float4 misc;         // depthClear, fill mip levels, -, -
+    float4 misc;         // -, fill mip levels, -, -
     int4 modes;          // view (0 normal 1 mask 2 coverage 3 camera 4 source 5 split), mask mode
                          // (0 alpha, 1 depth), source is linear, target is linear
     int4 has;            // a person mask this frame, person depth this frame, -, -
@@ -196,10 +196,15 @@ static float4 erasePixel(float2 uv, float4 src, float coverage,
     return float4(o, 1.0f);
 }
 
-static float depthCoverage(depth2d<float> depth, float2 uv, constant EraseParams &p) {
+/// Nothing was drawn where the depth is still its clear value: 0 with reverse Z, 1 without. Both
+/// count (no virtual surface sits exactly on the near or far plane), so no setting is needed.
+static bool depthCleared(float d) {
+    return d <= 1e-6f || d >= 0.999999f;
+}
+
+static float depthCoverage(depth2d<float> depth, float2 uv) {
     constexpr sampler n(filter::nearest, address::clamp_to_edge);
-    float d = depth.sample(n, uv);
-    return fabs(d - p.misc.x) > 1e-6f ? 1.0f : 0.0f;
+    return depthCleared(depth.sample(n, uv)) ? 0.0f : 1.0f;
 }
 
 struct EraseVertexOut {
@@ -238,7 +243,7 @@ fragment float4 eraseFragmentDepth(EraseVertexOut in [[stage_in]],
                                    constant EraseParams &p [[buffer(0)]]) {
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     float4 src = source.sample(s, in.uv);
-    return erasePixel(in.uv, src, depthCoverage(depth, in.uv, p), camY, camCbCr, mask, fill, p);
+    return erasePixel(in.uv, src, depthCoverage(depth, in.uv), camY, camCbCr, mask, fill, p);
 }
 
 // The same as compute kernels, for a target that is not a render target.
@@ -271,14 +276,14 @@ kernel void eraseKernelDepth(texture2d<float> source [[texture(0)]],
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     float2 uv = (float2(gid) + 0.5f) / float2(float(target.get_width()), float(target.get_height()));
     float4 src = source.sample(s, uv);
-    target.write(erasePixel(uv, src, depthCoverage(depth, uv, p), camY, camCbCr, mask, fill, p), gid);
+    target.write(erasePixel(uv, src, depthCoverage(depth, uv), camY, camCbCr, mask, fill, p), gid);
 }
 
 // --- the probe: one frame's facts for the PC ---
 //
 // Over every 8th pixel of the source: counts[0] samples; [1] alpha < 0.02, [2] between, [3] > 0.98;
-// [4] depth == 0, [5] depth == 1, [6] other depth (depth probe only); over the pixels whose depth is
-// the clear value (or, without depth, alpha < 0.02): [7] samples, [8..10] the source's rgb,
+// [4] depth == 0, [5] depth == 1, [6] other depth (depth probe only); over the pixels where nothing
+// was drawn (depth 0 or 1; without depth, alpha < 0.02): [7] samples, [8..10] the source's rgb,
 // [11..13] our camera rgb as decoded, [14..16] the same made linear (sums of 0..255 each).
 
 static void probeAdd(device atomic_uint *counts, uint i, uint v) {
@@ -314,7 +319,7 @@ kernel void eraseProbeDepth(texture2d<float, access::read> source [[texture(0)]]
     uint2 dp = uint2(min(px.x * depth.get_width() / W, depth.get_width() - 1), min(px.y * depth.get_height() / H, depth.get_height() - 1));
     float d = depth.read(dp);
     probeAdd(counts, d == 0.0f ? 4 : (d == 1.0f ? 5 : 6), 1);
-    if (fabs(d - p.misc.x) < 1e-6f) {
+    if (depthCleared(d)) {
         probeColour(counts, c, camY, camCbCr, (float2(px) + 0.5f) / float2(float(W), float(H)), p);
     }
 }

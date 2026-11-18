@@ -8,14 +8,21 @@
 // every absolute pose, and the hand gets a new absolute pose every frame.
 //
 // API
-//   LOOKS = ['translucent', 'solid', 'edges', 'occluder', 'off']
+//   LOOKS = ['translucent', 'solid', 'edges', 'occluder', 'model', 'off']
 //     translucent  light blue, opacity 0.45        solid   opaque light blue
 //     edges        the 12 edges of each box (native style 'edges')
 //     occluder     invisible boxes that hide virtual things behind them (material 'occlusion')
-//                  plus thin edges so the hand model can be seen; person occlusion is switched
-//                  off meanwhile (the real hand would hide the boxes that stand for it) and
-//                  restored when the look changes again
+//                  plus thin edges so the hand model can be seen
+//     model        the hand as a thing like the furniture: opaque, the furniture's wood colour and
+//                  roughness (furniture-spec.js), the palm a shade darker ("the hand as a model",
+//                  layer 1; with a shell over 1 it covers the real hand)
 //     off          nothing drawn natively (tracking, the overlay and lastRows still work)
+//   Person occlusion is switched off while the look stands in for the real hand ('occluder',
+//   'model') or the real hand is erased (the real hand would hide the boxes that stand for it), and
+//   restored when that ends.
+//   erase = {on, mask?, dilate?, feather?, …}: the native erase option (docs/protocol.md §2,
+//   ios/ARApp/HandEraser.swift; layer 2): the real hand erased from the camera picture. Sent only
+//   when it changes, and only once it has been on (an app without it never hears of it).
 //   SHELLS = [1, 1.15, 1.3]   box size factor (sizes travel with every frame, so no rebuild)
 //   OVERLAYS = ['off', 'joints', 'boxes']
 //     joints  Vision's 2D joints of the frame, through its display transform
@@ -25,16 +32,18 @@
 //   init(model) -> Promise     (re)creates the groups; call after every ar.start (a start with
 //                              reset removes all groups)
 //   setModel(model) -> Promise new sizes (rebuilds once)
-//   set({look, shell, overlay, shadow}) -> Promise   changes only what differs; a new look rebuilds
-//                              the group once, never per frame
-//   look, shell, overlay, shadow      current settings
-//   personOcclusion            what the page wants while the look is not 'occluder'
+//   set({look, shell, overlay, shadow, erase}) -> Promise   changes only what differs; a new look
+//                              rebuilds the group once, never per frame; erase: true / false or a
+//                              config object (merged into the current one)
+//   look, shell, overlay, shadow, erase   current settings
+//   personOcclusion            what the page wants while the look does not stand in for the hand
 //   show(pose, frameT, frame?) moves the boxes (one ar.updateGroups for hand + shadow); draws the overlay
 //   hide(frame?)               hides the groups (one message, only on the change); the overlay
 //                              still draws the frame's joints in 'joints' mode
 //   setPlanes(planes)          the ar.planes list; the shadow falls on the plane just under the palm
 //   lastRows                   the last poseBoxes rows sent (world boxes; e.g. for contact tests)
-//   dispose() -> Promise       removes both groups, restores person occlusion, clears the overlay
+//   dispose() -> Promise       removes both groups, restores person occlusion, erasing off, clears
+//                              the overlay
 // Helpers
 //   planeUnder(planes, p, {maxBelow = 0.8, margin = 0.1}) -> {id, class, y, p, n} | null
 //     the highest horizontal plane below the point p whose extent (grown by margin) contains it
@@ -46,8 +55,12 @@ import { add, sub, scale, dot, cross, norm, len, quatRotate, quatFromBasis, proj
 import { segmentSizes } from './model.js';
 import { poseBoxes, palmBoxCentre } from './pose.js';
 import { onPlane } from './scan.js';
+import { COLORS, ROUGHNESS } from '../furniture-spec.js';
 
-export const LOOKS = ['translucent', 'solid', 'edges', 'occluder', 'off'];
+export const LOOKS = ['translucent', 'solid', 'edges', 'occluder', 'model', 'off'];
+/** Looks that stand in for the real hand: person occlusion is off while they show. */
+const OWN_HAND_LOOKS = ['occluder', 'model'];
+const srgb = (hex) => [((hex >> 16) & 255) / 255, ((hex >> 8) & 255) / 255, (hex & 255) / 255];
 export const SHELLS = [1, 1.15, 1.3];
 export const OVERLAYS = ['off', 'joints', 'boxes'];
 
@@ -63,6 +76,8 @@ function boxLooks(look) {
       return [{ color: [0.35, 0.9, 1], material: 'unlit', style: 'edges', edge: 0.0015 }];
     case 'occluder':
       return [{ material: 'occlusion' }, { color: [1, 1, 1], material: 'unlit', style: 'edges', edge: 0.001, opacity: 0.9 }];
+    case 'model':
+      return [{ color: srgb(COLORS.wood), opacity: 1, material: 'pbr', roughness: ROUGHNESS.wood }];
     case 'translucent':
     default:
       return [{ color: [0.55, 0.8, 1], opacity: 0.45, material: 'pbr', roughness: 0.5 }];
@@ -149,7 +164,9 @@ export class HandView {
     this._created = false;
     this._shown = false; // the hand group is visible on the native side
     this._shadowShown = false;
-    this._occluding = false; // person occlusion is off because of the 'occluder' look
+    this._occluding = false; // person occlusion is off because of the look or the erasing
+    this.erase = { on: false };
+    this._sentErase = null; // the erase config last sent (JSON), null = none since init
     this._overlayDrawn = false;
   }
 
@@ -157,6 +174,7 @@ export class HandView {
     if (model) this.model = model;
     this._created = false;
     this._occluding = null; // a new session: send person occlusion once whatever it was before
+    this._sentErase = null; // … and the erase config, if it is on
     this._shown = false;
     this._shadowShown = false;
     await this._build();
@@ -167,7 +185,7 @@ export class HandView {
     if (this._created) await this._build();
   }
 
-  async set({ look, shell, overlay, shadow } = {}) {
+  async set({ look, shell, overlay, shadow, erase } = {}) {
     let rebuild = false;
     if (look !== undefined && look !== this.look && LOOKS.includes(look)) {
       this.look = look;
@@ -185,19 +203,35 @@ export class HandView {
         this.ar.updateGroups([{ id: this.shadowId, visible: false }]);
       }
     }
-    await this._occlusionFor(this.look);
+    if (erase !== undefined && erase !== null) {
+      const next = typeof erase === 'object' ? { ...this.erase, ...erase } : { ...this.erase, on: Boolean(erase) };
+      next.on = Boolean(next.on);
+      delete next.probe; // one-shot: the page asks for a probe itself
+      this.erase = next;
+    }
+    await this._syncNative();
     if (rebuild && this._created) await this._build();
   }
 
-  /** Person occlusion off while the look is 'occluder' (else the real hand hides its own model), back after. */
-  async _occlusionFor(look) {
-    const want = look === 'occluder';
-    if (want === this._occluding) return;
-    this._occluding = want;
+  /**
+   * Person occlusion off while the look stands in for the real hand or the real hand is erased
+   * (else the real hand hides its own model), back after; the erase config when it changed.
+   */
+  async _syncNative(look = this.look, erase = this.erase) {
+    const opts = {};
+    const off = OWN_HAND_LOOKS.includes(look) || Boolean(erase.on);
+    if (off !== this._occluding) {
+      this._occluding = off;
+      opts.personOcclusion = off ? false : this.personOcclusion;
+    }
+    const e = JSON.stringify(erase);
+    if (e !== this._sentErase && (erase.on || this._sentErase !== null)) opts.erase = erase;
+    if (!Object.keys(opts).length) return;
     try {
-      await this.ar.setOptions({ personOcclusion: want ? false : this.personOcclusion });
+      await this.ar.setOptions(opts);
+      if (opts.erase) this._sentErase = e;
     } catch {
-      // AR not running: the page sets person occlusion again when it starts
+      // AR not running: the page sets these again when it starts (init)
     }
   }
 
@@ -228,7 +262,7 @@ export class HandView {
     await this.ar.setGroup(this.shadowId, shadowBoxes, { visible: false });
     this._shadowShown = false;
     this._created = true;
-    await this._occlusionFor(this.look);
+    await this._syncNative();
   }
 
   setPlanes(planes) {
@@ -283,7 +317,8 @@ export class HandView {
     this._created = false;
     this._shown = false;
     this._clearOverlay();
-    await this._occlusionFor('off');
+    this.erase = { ...this.erase, on: false };
+    await this._syncNative('off', this.erase);
     for (const id of [this.groupId, this.shadowId]) {
       try {
         await this.ar.removeGroup(id);

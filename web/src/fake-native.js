@@ -32,7 +32,10 @@
 // removes all groups and the light; ar.start with reset removes all groups; ar.updateGroups with an
 // id applies what it can and answers {error: 'N update(s) skipped: …'}; a bad hands config makes
 // ar.start / ar.setOptions / ar.hands fail before anything changes; a new orientation without a
-// pointTransform takes that orientation's default, pointTransform null goes back to it.
+// pointTransform takes that orientation's default, pointTransform null goes back to it. The erase
+// option (HandEraser.swift) is checked and kept as the app does (also across ar.start, until the
+// page goes), but nothing is erased from the stand-in picture; `probe: true` answers with a made-up
+// "ar.erase" event. With &features= lacking "erase" the key is ignored, as the stage-3 app does.
 //
 // Hooks for tests and the hand simulator, on window.__fakeNative:
 //   handSource = null | (fake, nowSeconds) => ar.hands event (or null to skip a frame). Called at the
@@ -71,7 +74,9 @@ const Z_FAR = 100;
 const CLOCK_OFFSET = 3600; // the native clock is not the page's: pages must not mix them
 const START_DELAY = 400; // ms before ar.start answers, as the camera takes a moment to come up
 const DETECT_AFTER = 1.5; // s after start until the planes are "found" and tracking is normal
-const ALL_FEATURES = ['ar', 'hands', 'groups', 'planes', 'depth', 'haptic', 'light'];
+const ALL_FEATURES = ['ar', 'hands', 'groups', 'planes', 'depth', 'haptic', 'light', 'erase'];
+const ERASE_DEFAULTS = { on: false, mask: 'alpha', dilate: 3, feather: 2, maxDepth: 0, strength: 1, view: 'normal', srcSpace: 'auto', dstSpace: 'auto' };
+const ERASE_VIEWS = ['normal', 'mask', 'coverage', 'camera', 'source', 'split'];
 const MAX_GROUPS = 64;
 const MAX_BOXES = 400;
 const MAX_DEPTH_PIXELS = 49152;
@@ -251,6 +256,8 @@ const fake = {
   groups: new Map(),
   light: null,
   handsConfig: { ...HANDS_DEFAULTS },
+  erase: { ...ERASE_DEFAULTS },
+  eraseFrames: 0,
   handSource: null,
   handSeq: 0,
   lastHands: null, // the last hand event
@@ -625,6 +632,65 @@ function handsError(p) {
     if (v !== undefined && bad[k] && bad[k](v)) return `hands: bad ${k}`;
   }
   return null;
+}
+
+/** Why an erase config is refused, or null (as HandEraser.swift: the whole message is refused). */
+function eraseError(p) {
+  if (!FEATURES.includes('erase') || p === undefined || p === null) return null;
+  if (typeof p !== 'object' || Array.isArray(p)) return 'erase: an object {on, mask, …}';
+  const bad = {
+    on: (v) => typeof v !== 'boolean',
+    mask: (v) => !['alpha', 'depth'].includes(v),
+    dilate: (v) => !(isNum(v) && Math.round(v) >= 0 && Math.round(v) <= 16),
+    feather: (v) => !(isNum(v) && Math.round(v) >= 0 && Math.round(v) <= 8),
+    maxDepth: (v) => !(isNum(v) && v >= 0),
+    strength: (v) => !isNum(v),
+    view: (v) => !ERASE_VIEWS.includes(v),
+    srcSpace: (v) => !['auto', 'linear', 'gamma'].includes(v),
+    dstSpace: (v) => !['auto', 'linear', 'gamma'].includes(v),
+    probe: (v) => typeof v !== 'boolean',
+  };
+  for (const [k, v] of Object.entries(p)) {
+    if (v !== undefined && v !== null && bad[k] && bad[k](v)) return `erase: bad ${k}`;
+  }
+  return null;
+}
+
+function setErase(p) {
+  if (!FEATURES.includes('erase') || !p) return;
+  const next = { ...fake.erase };
+  for (const [k, v] of Object.entries(p)) {
+    if (!(k in ERASE_DEFAULTS) || v === undefined || v === null) continue;
+    next[k] = k === 'dilate' || k === 'feather' ? Math.round(v) : k === 'strength' ? Math.min(Math.max(v, 0), 1) : v;
+  }
+  if (next.on && !fake.erase.on) fake.eraseFrames = 0;
+  fake.erase = next;
+  if (p.probe === true) {
+    setTimeout(() => {
+      if (!fake.erase.on || !fake.running) return; // the app probes inside a drawn frame
+      const alpha = next.mask === 'alpha';
+      emit({
+        type: 'ar.erase',
+        probe: {
+          fake: true,
+          seq: (fake.eraseProbes = (fake.eraseProbes || 0) + 1),
+          config: { ...fake.erase },
+          source: { format: 'bgra8Unorm_srgb', size: [1179, 2556], usage: 23, type: 2, samples: 1 },
+          depth: { format: 'depth32Float', size: [1179, 2556], usage: 17, type: 2, samples: 1 },
+          target: { format: 'bgra8Unorm_srgb', size: [1179, 2556], usage: 23, type: 2, samples: 1 },
+          mainThread: true,
+          depthRead: true,
+          personMask: true,
+          samples: 47376,
+          alpha: alpha ? { low: 0.9, mid: 0.01, high: 0.09 } : { low: 0, mid: 0, high: 1 },
+          depth: { zero: 0.85, one: 0, other: 0.15 },
+          background: { samples: 40270, source: alpha ? [0, 0, 0] : [0.21, 0.19, 0.17], cameraGamma: [0.48, 0.45, 0.42], cameraLinear: [0.2, 0.18, 0.16] },
+          srcLinear: true,
+          dstLinear: true,
+        },
+      });
+    }, 120);
+  }
 }
 
 function setHands(p) {
@@ -1326,12 +1392,17 @@ function state() {
     personOcclusion: fake.options.personOcclusion !== false,
     hasFurniture: fake.groups.has('furniture'),
     hands: { ...fake.handsConfig },
+    ...(FEATURES.includes('erase')
+      ? { erase: { ...fake.erase, frames: fake.erase.on ? Math.round((fake.now() - fake.startedAt) * 60) : 0, failures: 0, lastFailure: '', background: fake.erase.on && fake.erase.mask === 'alpha' ? 'clear' : 'camera', attached: fake.erase.on } }
+      : {}),
   };
 }
 
 function applyOptions(p) {
-  Object.assign(fake.options, p);
+  const { erase, ...rest } = p;
+  Object.assign(fake.options, rest);
   if (p.hands && typeof p.hands === 'object') setHands(p.hands);
+  if (erase && typeof erase === 'object') setErase(erase);
   restartStatus();
 }
 
@@ -1341,7 +1412,7 @@ const handlers = {
   openSettings: () => ({ ok: true }),
   'ar.start': (p) => {
     // as the app: a bad hands config fails the start before the camera or the session is touched
-    const bad = FEATURES.includes('hands') && p.hands !== undefined ? handsError(p.hands) : null;
+    const bad = (FEATURES.includes('hands') && p.hands !== undefined ? handsError(p.hands) : null) || eraseError(p.erase);
     if (bad) return { error: bad };
     fake.started = true;
     fake.running = true;
@@ -1381,7 +1452,7 @@ const handlers = {
   },
   'ar.setOptions': (p) => {
     if (!fake.started) return { error: 'ar-not-started' };
-    const bad = FEATURES.includes('hands') && p.hands !== undefined ? handsError(p.hands) : null;
+    const bad = (FEATURES.includes('hands') && p.hands !== undefined ? handsError(p.hands) : null) || eraseError(p.erase);
     if (bad) return { error: bad }; // the whole call is refused: nothing changes
     applyOptions(p);
     return state();

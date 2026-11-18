@@ -22,6 +22,9 @@
 //   depth(opts)                                                     'depth'   a piece of the LiDAR map (§7)
 //   setLight(opts)                                                  'light'   one directional light (§8)
 //   haptic(opts)                                                    'haptic'  works without AR, never rejects (§9)
+//   setOptions({erase: {on, mask, dilate, feather, …, probe}}) onErase(fn)   'erase'  the person
+//                                    (the real hand) erased from the camera picture (§2); an app
+//                                    without the feature ignores the key
 // updateGroups() is fire-and-forget (no reply, no promise), because it is sent every frame.
 // In the stage-3 app the stage-2 furniture is the group "furniture" (anchored): moveGroup('furniture', …)
 // nudges it relative to where ARKit has put it by now.
@@ -65,6 +68,8 @@ export const clearFurniture = () => callNative('ar.clearFurniture');
 export const onStatus = (fn) => onNativeEvent('ar.status', fn);
 export const onError = (fn) => onNativeEvent('ar.error', fn);
 export const onInterrupted = (fn) => onNativeEvent('ar.interrupted', fn);
+/** fn({probe: {source, depth, target (formats), alpha, depth, background, srcLinear, dstLinear, config, …}}) */
+export const onErase = (fn) => onNativeEvent('ar.erase', fn);
 
 /** x, y: 0..1 of the screen (left→right, top→bottom). */
 export const raycast = (x, y, allowing = 'estimatedPlane', alignment = 'horizontal') =>

@@ -43,7 +43,8 @@ implement it. Anything not listed here does not exist.
   every frame (`postNative()` in native.js).
 - native → web event: `window.__nativeEvent({type, ...})`.
 - `window.__nativeInfo = {version, buildTime, label, ios, model, features}` before page scripts.
-  `features` from stage 3: `["ar", "hands", "groups", "planes", "depth", "haptic", "light"]`.
+  `features` from stage 3: `["ar", "hands", "groups", "planes", "depth", "haptic", "light"]`;
+  `"erase"` from the "hand as a model" app (2026-11-18, §2 `erase`).
   Pages check a feature before using it (`hasFeature('hands')`); the stage-2 app has only `"ar"`.
 
 ## 2. Session (unchanged from stage 2, with additions)
@@ -63,6 +64,37 @@ sceneReconstruction, horizontalPlanes, verticalPlanes, reset` (fixed for a run) 
 Added in stage 3 (changeable): `meshReceivesLighting` (bool: virtual lights light the LiDAR mesh
 and virtual objects cast shadows on it), `planeEvents` (bool, default true), `planesHz` (default 2),
 `hands` (an `ar.hands` config object, applied when the session runs).
+
+**`erase`** (feature `"erase"`; changeable; an app without the feature ignores the key) — erase the
+person (the real hand) from the camera picture, so only the hand model is seen
+(`ios/ARApp/HandEraser.swift`, `HandEraser.metal`). An object; keys left out keep their value, a bad
+one refuses the whole `ar.start` / `ar.setOptions`. The config lasts until the page changes (also
+across `ar.stop` / `ar.start`).
+
+| key | default | |
+|---|---|---|
+| `on` | false | |
+| `mask` | `'alpha'` | how virtual content is told from the camera. `'alpha'`: RealityKit draws on a clear background and the native layer draws the camera itself (out = src + (1 − α)·picture). `'depth'`: RealityKit draws its camera as usual; a pixel with depth (not 0 or 1) is virtual — **needs `meshOcclusion: false`** (the occlusion mesh writes depth everywhere) |
+| `dilate` | 3 | person-mask pixels (the mask is 256 × 192 over the whole image) the erased area grows by, 0–16 |
+| `feather` | 2 | soft edge, mask pixels, 0–8 |
+| `maxDepth` | 0 | metres; person pixels farther away are kept (0 = all) |
+| `strength` | 1 | 0–1; less lets the real hand show through |
+| `view` | `'normal'` | debug: `'mask'` (erased area tinted red), `'coverage'` (white = virtual), `'camera'` (the native camera picture only), `'source'` (RealityKit's picture as it came), `'split'` (left the native camera, right RealityKit's) |
+| `srcSpace`, `dstSpace` | `'auto'` | `'linear'` / `'gamma'`: how RealityKit's source / the screen texture hold colour, if the pixel format guesses wrong |
+| `probe` | – | `true`: measure one frame and answer with an `ar.erase` event (not kept) |
+
+The erased area is filled from the pixels around it (pull-push over a mip pyramid). The page
+switches `personOcclusion` off while erasing (the real hand is no longer in the picture).
+`ar.state` adds `erase: {…config, frames, failures, lastFailure, background: 'clear' | 'camera',
+attached}`. A frame that cannot be drawn shows RealityKit's own picture and is logged
+("erase: frame failed").
+
+Event **`ar.erase`** `{probe: {seq, config, source, depth, target ({format, size, usage, type,
+samples} each), mainThread, depthRead, personMask, samples, alpha: {low, mid, high} (shares of
+every 8th pixel with α < 0.02, between, > 0.98), depth?: {zero, one, other}, background: {samples,
+source, cameraGamma, cameraLinear} (mean rgb 0..1 where nothing was drawn: RealityKit's pixel, and
+the native camera picture decoded / made linear), srcLinear, dstLinear}}`. Also logged on the PC
+("erase: probe"), with "erase: textures" once per launch.
 
 `ar.start`'s reply adds `vision: {handPose: bool}`.
 

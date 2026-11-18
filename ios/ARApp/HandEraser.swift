@@ -14,14 +14,14 @@ import UIKit
 // the camera ("mask"):
 //   'alpha'  RealityKit draws on a clear background (environment.background = .color(.clear)):
 //            the source's alpha is the virtual coverage; out = src + (1 − a) · picture.
-//   'depth'  RealityKit draws its camera picture as usual and a pixel whose depth is not the clear
-//            value is virtual. The LiDAR occlusion mesh writes depth too, so meshOcclusion must be
-//            off for this one.
+//   'depth'  RealityKit draws its camera picture as usual and a pixel whose depth is not a clear
+//            value (0 or 1, whichever way RealityKit's depth runs) is virtual. The LiDAR occlusion
+//            mesh writes depth too, so meshOcclusion must be off for this one.
 // The page switches person occlusion off while erasing (the real hand is no longer in the
 // picture, so it must not hide anything either).
 //
 // All of it is set from the page: ar.setOptions {erase: {on, mask, dilate, feather, maxDepth,
-// strength, view, srcSpace, dstSpace, depthClear, probe}} (docs/protocol.md §2). `probe: true`
+// strength, view, srcSpace, dstSpace, probe}} (docs/protocol.md §2). `probe: true`
 // measures one frame (alpha and depth of the source, its colour against our camera image) and
 // sends it as an "ar.erase" event and a log line, with the texture formats: what the PC needs to
 // know which mask works on this phone.
@@ -43,12 +43,9 @@ struct EraseConfig: Equatable {
     /// How the source / target hold colour: 'auto' (by pixel format), 'linear' or 'gamma'.
     var srcSpace = "auto"
     var dstSpace = "auto"
-    /// The source depth's value where nothing was drawn ('depth' mask; reverse Z → 0).
-    var depthClear: Double = 0
 
     static let known: Set<String> = [
-        "on", "mask", "dilate", "feather", "maxDepth", "strength", "view", "srcSpace", "dstSpace",
-        "depthClear", "probe",
+        "on", "mask", "dilate", "feather", "maxDepth", "strength", "view", "srcSpace", "dstSpace", "probe",
     ]
     static let views = ["normal", "mask", "coverage", "camera", "source", "split"]
     static let spaces = ["auto", "linear", "gamma"]
@@ -86,10 +83,6 @@ struct EraseConfig: Equatable {
             guard Self.spaces.contains(s) else { throw PayloadError("dstSpace: auto, linear or gamma") }
             c.dstSpace = s
         }
-        if let v = try optionalNumber(p, "depthClear") {
-            guard v == 0 || v == 1 else { throw PayloadError("depthClear: 0 or 1") }
-            c.depthClear = v
-        }
         _ = try optionalBool(p, "probe")
         self = c
     }
@@ -98,7 +91,6 @@ struct EraseConfig: Equatable {
         [
             "on": on, "mask": mask, "dilate": dilate, "feather": feather, "maxDepth": round5(maxDepth),
             "strength": round5(strength), "view": view, "srcSpace": srcSpace, "dstSpace": dstSpace,
-            "depthClear": depthClear,
         ]
     }
 }
@@ -401,7 +393,7 @@ final class HandEraser: @unchecked Sendable {
                 fill = try texture(device, .rgba16Float, fw, fh, write: true, mipmapped: true)
             }
             guard let dilated, let feathered, let fill else { throw EraseFailure("no mask textures") }
-            params.misc = SIMD4<Float>(Float(c.depthClear), Float(fill.mipmapLevelCount), 0, 0)
+            params.misc = SIMD4<Float>(0, Float(fill.mipmapLevelCount), 0, 0)
             guard let enc = cb.makeComputeCommandEncoder() else { throw EraseFailure("no compute encoder") }
             enc.label = "erase mask"
             enc.setComputePipelineState(dilatePipeline)
@@ -429,7 +421,7 @@ final class HandEraser: @unchecked Sendable {
             maskTexture = feathered
             fillTexture = fill
         } else {
-            params.misc = SIMD4<Float>(Float(c.depthClear), 1, 0, 0)
+            params.misc = SIMD4<Float>(0, 1, 0, 0)
         }
 
         if probe {
